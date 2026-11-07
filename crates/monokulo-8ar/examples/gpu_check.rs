@@ -1,18 +1,37 @@
-//! Holds a GPU to the CPU's answers at length, for development: the app runs a
-//! short form of this (`vectors.rs`) each time the GPU starts.
+//! Holds a GPU to curve25519-dalek's answers at length, for development: the
+//! crate runs a short form of this (`vectors.rs`) each time the GPU starts.
 //!
 //!   cargo run --release -p monokulo-8ar --example gpu_check [--any] [--rounds N] [--batch N] [--windows N] [--group N] [--every N]
 //!
 //! It checks the shader's field arithmetic on the values that break field
-//! arithmetic, then 8aR against curve25519-dalek on random keys, small-order and
+//! arithmetic, against plain big integers, then 8aR against curve25519-dalek on random keys, small-order and
 //! torsioned points, off-curve keys and awkward view keys, at sizes either side
 //! of a workgroup and of a batch. It stops at the first difference.
 
 use curve25519_dalek::{Scalar, constants::ED25519_BASEPOINT_TABLE, constants::EIGHT_TORSION, edwards::{CompressedEdwardsY, EdwardsPoint}};
-use monokulo_8ar::{
-    fe::{self, Fe},
-    gpu::{Gpu, TUNING, Tuning},
-};
+use crypto_bigint::{Encoding, U256, U512};
+use monokulo_8ar::gpu::{Digits, Gpu, TUNING, Tuning};
+
+const P_BIG: U256 = U256::from_be_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed");
+
+/// One field operation, done with big integers: slow and plainly right.
+fn field_answer(op: i32, a: &[u32; 8], b: &[u32; 8]) -> [u32; 8] {
+    let big = |limbs: &[u32; 8]| U256::from_le_bytes(to_bytes(*limbs)).wrapping_rem(&P_BIG);
+    let (a, b) = (big(a), big(b));
+    let times = |x: &U256, y: &U256| {
+        let (lo, hi) = x.mul_wide(y);
+        hi.concat(&lo).wrapping_rem(&P_BIG.resize::<{ U512::LIMBS }>()).resize::<{ U256::LIMBS }>()
+    };
+    let answer = match op {
+        0 => a.add_mod(&b, &P_BIG),
+        1 => a.sub_mod(&b, &P_BIG),
+        2 => times(&a, &b),
+        3 => times(&a, &a),
+        4 => a.neg_mod(&P_BIG),
+        _ => a,
+    };
+    to_limbs(answer.to_le_bytes())
+}
 
 /// A small generator with no dependency, so each run's values can be replayed.
 struct Rng(u64);
@@ -109,16 +128,7 @@ fn field(gpu: &Gpu, rng: &mut Rng) -> u64 {
         for chunk in pairs.chunks(gpu.tuning().batch) {
             let got = gpu.check_field(op, chunk).expect("the GPU ran");
             for (i, (a, b)) in chunk.iter().enumerate() {
-                let (fa, fb) = (Fe::from_limbs(a), Fe::from_limbs(b));
-                let want = match op {
-                    0 => fa.add(&fb),
-                    1 => fa.sub(&fb),
-                    2 => fa.mul(&fb),
-                    3 => fa.sq(),
-                    4 => fa.neg(),
-                    _ => fa,
-                };
-                assert_eq!(got[i], to_limbs(want.to_bytes()), "field op {op} at {} on {a:x?} {b:x?}", at + i);
+                assert_eq!(got[i], field_answer(op, a, b), "field op {op} at {} on {a:x?} {b:x?}", at + i);
                 checked += 1;
             }
             at += chunk.len();
@@ -133,27 +143,16 @@ enum Want {
 }
 
 fn compare(gpu: &Gpu, view: &Scalar, keys: &[[u8; 32]], wants: &[Want], what: &str) {
-    let digits = fe::Digits::new(&view.to_bytes());
+    let digits = Digits::new(&view.to_bytes());
     let got = gpu.derive(&digits, keys).expect("the GPU ran");
     assert_eq!(got.len(), keys.len());
-    let mut points = vec![];
-    let mut ok = vec![];
-    for (i, want) in wants.iter().enumerate().take(got.len()) {
+    for (i, want) in wants.iter().enumerate() {
         match (got.get(i), want) {
-            (Some(p), Want::Point(_)) => {
-                points.push(p);
-                ok.push(i);
-            }
+            (Some(bytes), Want::Point(want)) => assert_eq!(&bytes, want, "{what}: key {i} of {}: {:x?}", keys.len(), keys[i]),
             (None, Want::OffCurve) => {}
             (Some(_), Want::OffCurve) => panic!("{what}: key {i} is off the curve, and the GPU took it"),
             (None, Want::Point(_)) => panic!("{what}: key {i} is on the curve, and the GPU refused it"),
         }
-    }
-    let mut compressed = vec![];
-    fe::compress_batch(&points, &mut compressed);
-    for (bytes, i) in compressed.iter().zip(ok) {
-        let Want::Point(want) = &wants[i] else { unreachable!() };
-        assert_eq!(bytes, want, "{what}: key {i} of {}: {:x?}", keys.len(), keys[i]);
     }
 }
 

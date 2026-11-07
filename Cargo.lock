@@ -394,11 +394,11 @@ name = "monokulo-8ar"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "crypto-bigint",
  "curve25519-dalek",
  "monero-wallet",
  "rand",
  "sha3",
- "subtle",
  "zeroize",
 ]
 

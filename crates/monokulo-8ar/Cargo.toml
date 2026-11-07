@@ -14,7 +14,7 @@ name = "monokulo_8ar"
 monero-wallet = "0.2"
 curve25519-dalek = { version = "4", features = ["precomputed-tables"] }
 sha3 = "0.10"
-subtle = "2"
+crypto-bigint = { version = "0.5", default-features = false }
 zeroize = "1"
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
 

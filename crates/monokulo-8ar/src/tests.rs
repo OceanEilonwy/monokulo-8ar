@@ -9,9 +9,6 @@ use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 
 use super::*;
 
-/// Fob's choice of where Auto hands over to the GPU, for the tests.
-const GPU_FROM: usize = 512;
-
 fn random_scalar(rng: &mut StdRng) -> Scalar {
     let mut bytes = [0; 64];
     rng.fill_bytes(&mut bytes);
@@ -22,75 +19,69 @@ fn dalek_derivation(view: &Scalar, r: &EdwardsPoint) -> [u8; 32] {
     (view * r).mul_by_cofactor().compress().to_bytes()
 }
 
-fn custom_derivations(view: &Scalar, keys: &[[u8; 32]]) -> Vec<Option<[u8; 32]>> {
-    let digits = fe::Digits::new(&view.to_bytes());
-    let decompressed: Vec<_> = keys.iter().map(fe::Ext::decompress).collect();
-    let points: Vec<_> = decompressed.iter().flatten().map(|r| fe::mul8(&digits, r)).collect();
-    let mut compressed = vec![];
-    fe::compress_batch(&points, &mut compressed);
-    let mut done = compressed.into_iter();
-    decompressed.iter().map(|r| r.as_ref().map(|_| done.next().unwrap())).collect()
-}
-
 /// The eight points of small order, on which curve code tends to go wrong.
 fn small_order() -> Vec<[u8; 32]> {
     use curve25519_dalek::constants::EIGHT_TORSION;
     EIGHT_TORSION.iter().map(|p| p.compress().to_bytes()).collect()
 }
 
-#[test]
-fn the_field_agrees_with_dalek_on_random_points_in_a_batch() {
-    let mut rng = StdRng::seed_from_u64(1);
-    for _ in 0..40 {
-        let view = random_scalar(&mut rng);
-        let points: Vec<EdwardsPoint> = (0..64).map(|_| &random_scalar(&mut rng) * ED25519_BASEPOINT_TABLE).collect();
-        let keys: Vec<[u8; 32]> = points.iter().map(|p| p.compress().to_bytes()).collect();
-        let ours = custom_derivations(&view, &keys);
-        for (p, got) in points.iter().zip(ours) {
-            assert_eq!(got, Some(dalek_derivation(&view, p)));
+/// What a sound GPU hands back for `keys`, worked out by curve25519-dalek.
+fn dalek_points(view: &Scalar, keys: &[[u8; 32]]) -> gpu::Points {
+    let mut words = vec![];
+    for key in keys {
+        match CompressedEdwardsY(*key).decompress() {
+            Some(r) => {
+                let bytes = dalek_derivation(view, &r);
+                words.extend(bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)));
+                words.push(0);
+            }
+            None => {
+                words.extend([0; 8]);
+                words.push(1);
+            }
         }
     }
+    gpu::Points::from_words(words)
+}
+
+/// How a test has blocks flagged: the GPU, or curve25519-dalek in its place.
+type Flagger = fn(&Prefilter, &Scalar, &[ScannableBlock], usize) -> Vec<bool>;
+
+/// The prefilter with curve25519-dalek doing the GPU's part, in batches of 100
+/// keys so that a few blocks take several.
+fn by_dalek(filter: &Prefilter, view: &Scalar, blocks: &[ScannableBlock], threads: usize) -> Vec<bool> {
+    filter.flag_with(blocks, threads, 0, 100, |keys| Some(dalek_points(view, keys))).expect("it filtered")
+}
+
+fn by_gpu(filter: &Prefilter, _view: &Scalar, blocks: &[ScannableBlock], threads: usize) -> Vec<bool> {
+    filter.flag(blocks, threads, 0).expect("the GPU filtered")
 }
 
 #[test]
-fn the_field_agrees_with_dalek_on_small_order_and_torsioned_points() {
-    let mut rng = StdRng::seed_from_u64(2);
-    let view = random_scalar(&mut rng);
-    let mut points: Vec<EdwardsPoint> = vec![];
-    for torsion in curve25519_dalek::constants::EIGHT_TORSION {
-        points.push(torsion);
-        points.push(&random_scalar(&mut rng) * ED25519_BASEPOINT_TABLE + torsion);
-    }
-    let keys: Vec<[u8; 32]> = points.iter().map(|p| p.compress().to_bytes()).collect();
-    for (p, got) in points.iter().zip(custom_derivations(&view, &keys)) {
-        assert_eq!(got, Some(dalek_derivation(&view, p)));
-    }
-    assert_eq!(small_order().len(), 8);
+fn the_dalek_stand_in_gives_what_a_gpu_gives() {
+    let view = Scalar::from(3u8);
+    // The first small y that isn't on the curve.
+    let bad = (2u8..).map(|y| {
+        let mut bytes = [0; 32];
+        bytes[0] = y;
+        bytes
+    }).find(|bytes| CompressedEdwardsY(*bytes).decompress().is_none()).unwrap();
+    let points = dalek_points(&view, &[small_order()[1], bad]);
+    assert_eq!(points.len(), 2);
+    assert_eq!(points.get(0), Some(dalek_derivation(&view, &CompressedEdwardsY(small_order()[1]).decompress().unwrap())));
+    assert_eq!(points.get(1), None, "off the curve");
 }
 
+/// Exactly the encodings monero-oxide takes go to the GPU as they are: the rest go
+/// as the identity, and the GPU refuses whatever's off the curve.
 #[test]
-fn extreme_view_keys_agree_with_dalek() {
-    let mut rng = StdRng::seed_from_u64(3);
-    let mut most = (Scalar::ZERO - Scalar::ONE).to_bytes();
-    let top = Scalar::from_bytes_mod_order(most);
-    most[0] = 0;
-    for view in [Scalar::ZERO, Scalar::ONE, Scalar::from(8u8), top, Scalar::from_bytes_mod_order(most)] {
-        let p = &random_scalar(&mut rng) * ED25519_BASEPOINT_TABLE;
-        assert_eq!(custom_derivations(&view, &[p.compress().to_bytes()])[0], Some(dalek_derivation(&view, &p)));
-    }
-}
-
-/// Exactly the encodings monero-oxide takes, whatever the bytes.
-#[test]
-fn decompressing_takes_exactly_what_monero_oxide_takes() {
+fn what_reaches_the_gpu_is_what_monero_oxide_takes() {
     let check = |bytes: [u8; 32]| {
-        let theirs = CompressedPoint::from(bytes).decompress();
-        let ours = fe::Ext::decompress(&bytes);
-        assert_eq!(theirs.is_some(), ours.is_some(), "{bytes:?}");
-        if ours.is_some() {
-            let view = Scalar::from(3u8);
-            let dalek: EdwardsPoint = theirs.unwrap().into();
-            assert_eq!(custom_derivations(&view, &[bytes])[0], Some(dalek_derivation(&view, &dalek)));
+        let theirs = CompressedPoint::from(bytes).decompress().is_some();
+        let ours = canonical(&bytes) && CompressedEdwardsY(bytes).decompress().is_some();
+        assert_eq!(theirs, ours, "{bytes:?}");
+        if !canonical(&bytes) {
+            assert_eq!(sendable(&bytes), CompressedPoint::IDENTITY.to_bytes());
         }
     };
     let mut rng = StdRng::seed_from_u64(4);
@@ -205,22 +196,23 @@ fn scanner_finds(scanner: &Scanner, block: ScannableBlock) -> bool {
     }
 }
 
-fn agree(name: &str, filter: &Prefilter, scanner: &Scanner, block: ScannableBlock, expected: bool) {
+fn agree(name: &str, flag: Flagger, w: &Wallet, filter: &Prefilter, scanner: &Scanner, block: ScannableBlock, expected: bool) {
     assert_eq!(scanner_finds(scanner, block.clone()), expected, "{name}: the Scanner's answer isn't the one this case is about");
-    assert_eq!(filter.flag(std::slice::from_ref(&block), 1, true, GPU_FROM)[0], expected, "{name}");
+    assert_eq!(flag(filter, &w.view, std::slice::from_ref(&block), 1)[0], expected, "{name}");
 }
 
 #[test]
 fn every_way_of_being_paid_is_flagged_and_strangers_are_not() {
-    every_way_of_being_paid();
+    every_way_of_being_paid(by_dalek);
 }
 
-/// The same on the GPU, chosen and through Auto. Needs a real GPU: the
-/// mode is global, so it's kept from the other tests.
+/// The same on the GPU. Needs a real GPU: it's started once for the process,
+/// so the other tests keep to curve25519-dalek.
 #[test]
 #[ignore = "needs a GPU; run with --ignored"]
 fn the_gpu_flags_the_same_blocks() {
-    set_mode(Mode::Gpu);
+    let (w, filter, _) = wallet();
+    assert_eq!(filter.flag(&[], 1, 0), None, "not started: asking starts it");
     for _ in 0..1200 {
         if engine::gpu_ready() {
             break;
@@ -228,13 +220,11 @@ fn the_gpu_flags_the_same_blocks() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(engine::gpu_ready(), "the GPU started");
-    every_way_of_being_paid();
-    many_blocks();
-    set_mode(Mode::Auto);
-    let (_, filter, _) = wallet();
+    assert!(matches!(engine(), Engine::Gpu { .. }));
+    every_way_of_being_paid(by_gpu);
+    many_blocks(by_gpu);
     let mut rng = StdRng::seed_from_u64(8);
-    // Enough keys for Auto to choose the GPU, and for more than one of its batches.
-    let (w, _, _) = wallet();
+    // More than one of the GPU's batches.
     let mut blocks = vec![];
     let mut expected = vec![];
     for i in 0..(crate::gpu::TUNING.batch + 300) {
@@ -244,13 +234,14 @@ fn the_gpu_flags_the_same_blocks() {
         blocks.push(block_of(vec![output], extra_of(&[point_of(&r)], None)));
         expected.push(pays);
     }
-    assert_eq!(filter.flag(&blocks, 4, true, GPU_FROM), expected);
+    assert_eq!(filter.flag(&blocks, 4, 0), Some(expected.clone()));
+    assert_eq!(by_dalek(&filter, &w.view, &blocks, 4), expected);
+    // Too few keys to be worth the GPU: the caller scans every block.
+    assert_eq!(filter.flag(&blocks, 4, blocks.len() + 1), None);
     assert!(engine::gpu_ready(), "and it hasn't been retired");
-    set_mode(Mode::Cpu);
-    assert_eq!(filter.flag(&blocks, 4, true, GPU_FROM), expected);
 }
 
-fn every_way_of_being_paid() {
+fn every_way_of_being_paid(flag: Flagger) {
     let (w, filter, scanner) = wallet();
     let mut rng = StdRng::seed_from_u64(5);
     let r = random_scalar(&mut rng);
@@ -259,31 +250,31 @@ fn every_way_of_being_paid() {
     let unwatched: EdwardsPoint = w.pair.subaddress(Network::Mainnet, SubaddressIndex::new(0, SUBADDRESS + 1).unwrap()).spend().into();
     let key = point_of(&r);
 
-    agree("primary, first output", &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[key], None)), true);
-    agree("primary, later output", &filter, &scanner, block_of(vec![stranger(&mut rng), stranger(&mut rng), paying(&w, &r, 2, w.spend)], extra_of(&[key], None)), true);
-    agree("subaddress", &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, sub)], extra_of(&[key], None)), true);
-    agree("unwatched subaddress", &filter, &scanner, block_of(vec![paying(&w, &r, 0, unwatched)], extra_of(&[key], None)), false);
-    agree("a stranger", &filter, &scanner, block_of(vec![stranger(&mut rng)], extra_of(&[key], None)), false);
+    agree("primary, first output", flag, &w, &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[key], None)), true);
+    agree("primary, later output", flag, &w, &filter, &scanner, block_of(vec![stranger(&mut rng), stranger(&mut rng), paying(&w, &r, 2, w.spend)], extra_of(&[key], None)), true);
+    agree("subaddress", flag, &w, &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, sub)], extra_of(&[key], None)), true);
+    agree("unwatched subaddress", flag, &w, &filter, &scanner, block_of(vec![paying(&w, &r, 0, unwatched)], extra_of(&[key], None)), false);
+    agree("a stranger", flag, &w, &filter, &scanner, block_of(vec![stranger(&mut rng)], extra_of(&[key], None)), false);
 
     // The tag's a filter, and absent on old outputs.
     let mut no_tag = paying(&w, &r, 0, w.spend);
     no_tag.view_tag = None;
-    agree("no view tag", &filter, &scanner, block_of(vec![no_tag], extra_of(&[key], None)), true);
+    agree("no view tag", flag, &w, &filter, &scanner, block_of(vec![no_tag], extra_of(&[key], None)), true);
     let mut wrong_tag = paying(&w, &r, 0, w.spend);
     wrong_tag.view_tag = Some(wrong_tag.view_tag.unwrap().wrapping_add(1));
-    agree("wrong view tag", &filter, &scanner, block_of(vec![wrong_tag], extra_of(&[key], None)), false);
+    agree("wrong view tag", flag, &w, &filter, &scanner, block_of(vec![wrong_tag], extra_of(&[key], None)), false);
 
     // Several keys, and additional keys, each with its own output.
     let other = random_scalar(&mut rng);
-    agree("second key", &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[point_of(&other), key], None)), true);
+    agree("second key", flag, &w, &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[point_of(&other), key], None)), true);
     let additional = [point_of(&other), key];
-    agree("additional key", &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], extra_of(&[point_of(&other)], Some(&additional))), true);
+    agree("additional key", flag, &w, &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], extra_of(&[point_of(&other)], Some(&additional))), true);
     let swapped = [key, point_of(&other)];
-    agree("additional key on another output", &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], extra_of(&[point_of(&other)], Some(&swapped))), false);
+    agree("additional key on another output", flag, &w, &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], extra_of(&[point_of(&other)], Some(&swapped))), false);
     let mut twice = extra_of(&[point_of(&other)], Some(&[point_of(&other), point_of(&other)]));
     twice.extend_from_slice(&extra_of(&[], Some(&additional))[..]);
-    agree("only the first list of additional keys", &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], twice), false);
-    agree("additional keys and no key", &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[], Some(&[key]))), false);
+    agree("only the first list of additional keys", flag, &w, &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], twice), false);
+    agree("additional keys and no key", flag, &w, &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[], Some(&[key]))), false);
 
     // Bad keys count as the identity, as they do for Monero: with the identity's
     // derivation, money can be paid to one.
@@ -292,37 +283,37 @@ fn every_way_of_being_paid() {
     assert!(CompressedPoint::from(bad).decompress().is_none());
     let zero = Scalar::ZERO;
     let identity_pays = |rng: &mut StdRng| block_of(vec![stranger(rng), paying(&w, &zero, 1, w.spend)], extra_of(&[bad], None));
-    agree("a badly encoded key", &filter, &scanner, identity_pays(&mut rng), true);
+    agree("a badly encoded key", flag, &w, &filter, &scanner, identity_pays(&mut rng), true);
 
     // Output keys that can't be scanned.
     let mut identity_out = stranger(&mut rng);
     identity_out.key = CompressedPoint::IDENTITY;
-    agree("identity output", &filter, &scanner, block_of(vec![identity_out], extra_of(&[key], None)), false);
+    agree("identity output", flag, &w, &filter, &scanner, block_of(vec![identity_out], extra_of(&[key], None)), false);
     let mut undecodable = stranger(&mut rng);
     undecodable.key = CompressedPoint::from(bad);
     undecodable.view_tag = None;
-    agree("undecodable output", &filter, &scanner, block_of(vec![undecodable], extra_of(&[key], None)), false);
+    agree("undecodable output", flag, &w, &filter, &scanner, block_of(vec![undecodable], extra_of(&[key], None)), false);
 
     // Not scanned at all.
-    agree("v1 transaction", &filter, &scanner, block_with(vec![paying(&w, &r, 0, w.spend)], extra_of(&[key], None), 16, 1), false);
-    agree("unreadable extra", &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], vec![0x77, 1, 2, 3]), false);
+    agree("v1 transaction", flag, &w, &filter, &scanner, block_with(vec![paying(&w, &r, 0, w.spend)], extra_of(&[key], None), 16, 1), false);
+    agree("unreadable extra", flag, &w, &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], vec![0x77, 1, 2, 3]), false);
     let mut no_ringct = block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[key], None));
     no_ringct.output_index_for_first_ringct_output = None;
-    agree("no RingCT outputs", &filter, &scanner, no_ringct, false);
+    agree("no RingCT outputs", flag, &w, &filter, &scanner, no_ringct, false);
 
     // The Scanner's refusals stay the Scanner's to make.
-    agree("a newer fork", &filter, &scanner, block_with(vec![stranger(&mut rng)], extra_of(&[key], None), NEWEST_FORK + 1, 0), true);
+    agree("a newer fork", flag, &w, &filter, &scanner, block_with(vec![stranger(&mut rng)], extra_of(&[key], None), NEWEST_FORK + 1, 0), true);
     let mut mismatched = block_of(vec![stranger(&mut rng)], extra_of(&[key], None));
     mismatched.block = Block::new(mismatched.block.header.clone(), mismatched.block.miner_transaction().clone(), vec![[1; 32]]).unwrap();
-    agree("transactions missing", &filter, &scanner, mismatched, true);
+    agree("transactions missing", flag, &w, &filter, &scanner, mismatched, true);
 }
 
 #[test]
 fn payments_in_ordinary_transactions_are_flagged_among_many_blocks() {
-    many_blocks();
+    many_blocks(by_dalek);
 }
 
-fn many_blocks() {
+fn many_blocks(flag: Flagger) {
     let (w, filter, scanner) = wallet();
     let mut rng = StdRng::seed_from_u64(6);
     let mut blocks = vec![];
@@ -341,8 +332,8 @@ fn many_blocks() {
         expected.push(pays);
         blocks.push(block);
     }
-    assert_eq!(filter.flag(&blocks, 4, true, GPU_FROM), expected);
-    assert_eq!(filter.flag(&blocks, 1, true, GPU_FROM), expected);
+    assert_eq!(flag(&filter, &w.view, &blocks, 4), expected);
+    assert_eq!(flag(&filter, &w.view, &blocks, 1), expected);
     for (block, pays) in blocks.into_iter().zip(expected) {
         assert_eq!(scanner_finds(&scanner, block), pays, "the Scanner has the same answer");
     }

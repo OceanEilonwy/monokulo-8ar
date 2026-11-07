@@ -9,20 +9,21 @@
 //! the outputs, their amounts and their subaddresses. So its one duty is never
 //! to miss, and anything it doesn't understand is flagged.
 //!
-//! The arithmetic runs on the CPU's cores or on the GPU ([`Mode`]). Which one is
-//! a matter of speed and of power, never of the answer: a GPU passes test
-//! vectors once per process before it's used, and with each wallet's view key
-//! (`vectors.rs`), or the CPU does the work.
+//! The arithmetic runs on the GPU, in Vulkan, and only there: a GPU passes test
+//! vectors once per process before it's used, and again with each wallet's view
+//! key (`vectors.rs`). Without a GPU that passed, or for a batch too small to be
+//! worth one, [`Prefilter::flag`] says it didn't filter, and the caller scans
+//! every block with the `Scanner`. Which way is a matter of speed and power,
+//! never of the answer. [`engine`] says which is in use.
 //!
 //! Written for Fob, whose `docs/decisions.md` gives the reasons (decisions 331,
-//! 332, 350, 351), and shared with monokulo-lws.
+//! 332, 350, 351, 359, 360), and shared with monokulo-lws.
 
 mod engine;
-pub mod fe;
 pub mod gpu;
 mod vectors;
 
-pub use engine::{Mode, check_wallet, gpu_failed, gpu_identity, gpu_ready, mode, rest, set_cache_dir, set_mode, warm_up};
+pub use engine::{Engine, Reason, check_wallet, engine, gpu_failed, gpu_identity, gpu_ready, rest, set_cache_dir, warm_up};
 
 use std::{
     collections::HashSet,
@@ -43,7 +44,7 @@ use zeroize::Zeroizing;
 
 /// `Scanner` refuses blocks past this fork, and must be the one to say so.
 const NEWEST_FORK: u8 = 16;
-/// How many keys share an inversion. A chunk is also how much a thread takes at once.
+/// How many keys a thread takes at once.
 const CHUNK: usize = 64;
 
 /// Runs the check a GPU must pass before it's used: for the test tool.
@@ -109,16 +110,27 @@ fn encoded_keys(extra: &Extra) -> Option<TxKeys> {
     (!keys.is_empty()).then_some((keys, additional))
 }
 
-/// 8a times the identity: the identity, in the projective form `finish` takes.
-fn identity_point() -> (fe::Fe, fe::Fe, fe::Fe) {
-    (fe::Fe([0; 5]), fe::Fe([1, 0, 0, 0, 0]), fe::Fe([1, 0, 0, 0, 0]))
+/// Whether `bytes` encodes y below p, and isn't a negative zero: x is zero only
+/// for y = 1 and y = -1. These are the encodings monero-oxide takes, before it
+/// asks whether the point is on the curve.
+fn canonical(bytes: &[u8; 32]) -> bool {
+    let sign = bytes[31] >> 7;
+    let top = bytes[31] & 0x7f;
+    // p is 2^255 - 19: ed ff .. ff 7f, little-endian.
+    let at_least_p = top == 0x7f && bytes[1..31].iter().all(|b| *b == 0xff) && bytes[0] >= 0xed;
+    if at_least_p {
+        return false;
+    }
+    let one = bytes[0] == 1 && bytes[1..31].iter().all(|b| *b == 0) && top == 0;
+    let minus_one = bytes[0] == 0xec && bytes[1..31].iter().all(|b| *b == 0xff) && top == 0x7f;
+    !(sign == 1 && (one || minus_one))
 }
 
 /// A key as the GPU may have it: it takes only canonical encodings, without a
-/// negative zero, so whatever `fe::Ext::decompress` refuses for those reasons
-/// becomes the identity, as it does on the CPU. Off the curve, the GPU says so.
+/// negative zero, so whatever monero-oxide refuses for those reasons becomes the
+/// identity, as Monero treats it. Off the curve, the GPU says so.
 fn sendable(key: &[u8; 32]) -> [u8; 32] {
-    if fe::canonical(key) { *key } else { CompressedPoint::IDENTITY.to_bytes() }
+    if canonical(key) { *key } else { CompressedPoint::IDENTITY.to_bytes() }
 }
 
 fn varint(mut n: usize, out: &mut Vec<u8>) {
@@ -152,17 +164,24 @@ fn in_chunks<T: Sync>(items: &[T], threads: usize, chunk: usize, each: impl Fn(u
     }
 }
 
+/// 8a times the identity, compressed: the identity.
+const IDENTITY: [u8; 32] = {
+    let mut bytes = [0; 32];
+    bytes[0] = 1;
+    bytes
+};
+
 /// What a wallet watches for: its view key and every spend key it could be paid at.
 #[derive(Clone)]
 pub struct Prefilter {
-    digits: fe::Digits,
+    digits: gpu::Digits,
     spends: HashSet<[u8; 32]>,
 }
 
 impl Prefilter {
     /// A filter for `pair`'s primary address. `view` is `pair`'s view key.
     pub fn new(pair: &ViewPair, view: &Zeroizing<[u8; 32]>) -> Prefilter {
-        Prefilter { digits: fe::Digits::new(view), spends: HashSet::from([pair.spend().compress().to_bytes()]) }
+        Prefilter { digits: gpu::Digits::new(view), spends: HashSet::from([pair.spend().compress().to_bytes()]) }
     }
 
     /// Watches a subaddress of `pair`, as `Scanner::register_subaddress` does.
@@ -171,11 +190,21 @@ impl Prefilter {
         self.spends.insert(pair.subaddress(Network::Mainnet, subaddress).spend().compress().to_bytes());
     }
 
-    /// Whether each of `blocks` could hold money for this wallet. Without
-    /// `gpu_allowed`, the CPU does the work whatever the mode. In [`Mode::Auto`]
-    /// the GPU takes over from `gpu_from` keys: the caller's choice, as where it
-    /// starts to pay depends on the device and on what the caller cares about.
-    pub fn flag(&self, blocks: &[ScannableBlock], threads: usize, gpu_allowed: bool, gpu_from: usize) -> Vec<bool> {
+    /// Whether each of `blocks` could hold money for this wallet, or `None` if
+    /// it didn't filter them: the GPU isn't ready or was retired, or the blocks
+    /// hold fewer than `min_keys` transaction keys, where a GPU batch costs more
+    /// than it saves (its cost is the caller's to weigh). The caller then scans
+    /// every block with the `Scanner`. Asking starts the GPU if it hasn't been.
+    pub fn flag(&self, blocks: &[ScannableBlock], threads: usize, min_keys: usize) -> Option<Vec<bool>> {
+        if !engine::usable() {
+            return None;
+        }
+        self.flag_with(blocks, threads, min_keys, engine::batch(), |keys| engine::derive(&self.digits, keys))
+    }
+
+    /// [`flag`](Prefilter::flag), with `derive` working out 8aR for at most `most`
+    /// keys at a time: the GPU, or curve25519-dalek in the tests.
+    fn flag_with(&self, blocks: &[ScannableBlock], threads: usize, min_keys: usize, most: usize, derive: impl Fn(&[[u8; 32]]) -> Option<gpu::Points>) -> Option<Vec<bool>> {
         let flags: Vec<AtomicBool> = blocks.iter().map(|_| AtomicBool::new(false)).collect();
         let found: std::sync::Mutex<Vec<Vec<Job>>> = std::sync::Mutex::new(vec![]);
         let numbered: Vec<(usize, &ScannableBlock)> = blocks.iter().enumerate().collect();
@@ -187,60 +216,41 @@ impl Prefilter {
             found.lock().expect("jobs lock").push(jobs);
         });
         let jobs: Vec<Job> = found.into_inner().expect("jobs lock").into_iter().flatten().collect();
-        match engine::route(jobs.len(), gpu_allowed, gpu_from) {
-            engine::Route::Cpu => in_chunks(&jobs, threads, CHUNK, |_, chunk| self.check(chunk, &flags)),
-            engine::Route::Gpu => self.with_gpu(&jobs, &flags, threads),
+        if jobs.len() < min_keys || !self.with_gpu(&jobs, &flags, threads, most, derive) {
+            return None;
         }
-        flags.into_iter().map(AtomicBool::into_inner).collect()
+        Some(flags.into_iter().map(AtomicBool::into_inner).collect())
     }
 
     /// The GPU works out every key's 8aR, a batch at a time, and the cores do
-    /// what follows. A GPU that fails hands everything left to the cores.
-    fn with_gpu(&self, jobs: &[Job], flags: &[AtomicBool], threads: usize) {
+    /// what follows. False if the GPU failed, which retires it.
+    fn with_gpu(&self, jobs: &[Job], flags: &[AtomicBool], threads: usize, most: usize, derive: impl Fn(&[[u8; 32]]) -> Option<gpu::Points>) -> bool {
         std::thread::scope(|scope| {
             // The GPU goes on to its next batch while the cores finish its last.
             let (done, finishing) = std::sync::mpsc::sync_channel::<(&[Job], gpu::Points)>(1);
             scope.spawn(move || {
                 for (part, points) in finishing {
                     in_chunks(part, threads, CHUNK, |at, chunk| {
-                        // Off the curve is the identity, as for the CPU.
-                        let points: Vec<_> = (at..at + chunk.len()).map(|i| points.get(i).unwrap_or_else(identity_point)).collect();
-                        self.finish(&points, chunk, flags);
+                        // Off the curve is the identity, as Monero treats it.
+                        let derivations: Zeroizing<Vec<[u8; 32]>> = Zeroizing::new((at..at + chunk.len()).map(|i| points.get(i).unwrap_or(IDENTITY)).collect());
+                        self.finish(&derivations, chunk, flags);
                     });
                 }
             });
-            let most = engine::batch();
-            for (i, part) in jobs.chunks(most).enumerate() {
+            for part in jobs.chunks(most) {
                 let keys: Vec<[u8; 32]> = part.iter().map(|job| sendable(&job.key)).collect();
-                match engine::derive(&self.digits, &keys) {
-                    Some(points) => {
-                        if let Err(unsent) = done.send((part, points)) {
-                            // The finishing thread has gone only by panicking, which the scope passes on.
-                            drop(unsent);
-                            return;
-                        }
-                    }
-                    // Failed, so this batch and the rest go to the cores.
-                    None => {
-                        in_chunks(&jobs[i * most..], threads, CHUNK, |_, chunk| self.check(chunk, flags));
-                        return;
-                    }
+                let Some(points) = derive(&keys) else { return false };
+                if let Err(unsent) = done.send((part, points)) {
+                    // The finishing thread has gone only by panicking, which the scope passes on.
+                    drop(unsent);
+                    return false;
                 }
             }
-        });
+            true
+        })
     }
 
-    fn check(&self, jobs: &[Job], flags: &[AtomicBool]) {
-        // Points the scan's own `Extra::keys` would turn into the identity are
-        // the identity here too, as Monero treats them.
-        let identity = fe::Ext::decompress(&CompressedPoint::IDENTITY.to_bytes()).expect("the identity decompresses");
-        let points: Vec<_> = jobs.iter().map(|job| fe::mul8(&self.digits, &fe::Ext::decompress(&job.key).unwrap_or(identity))).collect();
-        self.finish(&points, jobs, flags);
-    }
-
-    fn finish(&self, points: &[(fe::Fe, fe::Fe, fe::Fe)], jobs: &[Job], flags: &[AtomicBool]) {
-        let mut derivations = Zeroizing::new(Vec::with_capacity(jobs.len()));
-        fe::compress_batch(points, &mut derivations);
+    fn finish(&self, derivations: &[[u8; 32]], jobs: &[Job], flags: &[AtomicBool]) {
         for (derivation, job) in derivations.iter().zip(jobs) {
             if !flags[job.block].load(Ordering::Relaxed) && self.pays_us(derivation, &job.outputs) {
                 flags[job.block].store(true, Ordering::Relaxed);

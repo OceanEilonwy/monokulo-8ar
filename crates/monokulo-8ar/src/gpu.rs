@@ -1,10 +1,10 @@
-//! 8aR on the phone's GPU, in Vulkan compute (`shaders/scan.comp`).
+//! 8aR on the GPU, in Vulkan compute (`shaders/scan.comp`).
 //!
-//! The GPU does the curve arithmetic and hands back projective points; the CPU
-//! compresses them with one inversion across a batch, and does everything after.
-//! A key that isn't on the curve comes back marked. Any Vulkan failure is an
-//! error for the caller, which scans on the CPU instead. Nothing here panics: a
-//! driver's behaviour is outside what the wallet can vouch for.
+//! The GPU does the curve arithmetic, inverts each point's Z and hands back the
+//! compressed points; the CPU does everything after. A key that isn't on the
+//! curve comes back marked. Any Vulkan failure is an error for the caller, which
+//! then scans without the prefilter. Nothing here panics: a driver's behaviour
+//! is outside what the wallet can vouch for.
 //!
 //! The view key's digits reach the GPU as push constants. They and the shader's
 //! working state are in memory the driver manages: the buffers are cleared after
@@ -17,7 +17,37 @@ use std::{cell::RefCell, ffi::CStr, path::PathBuf};
 use ash::vk;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::fe::{Digits, Fe};
+/// A secret scalar, the view key, as signed base-16 digits: what the GPU is given.
+#[derive(Clone)]
+pub struct Digits([i8; 64]);
+
+impl Drop for Digits {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Digits {
+    /// Digit `i`, the least significant first.
+    pub fn get(&self, i: usize) -> i8 {
+        self.0[i]
+    }
+
+    pub fn new(scalar: &[u8; 32]) -> Digits {
+        assert!(scalar[31] <= 127);
+        let mut d = [0i8; 64];
+        for i in 0..32 {
+            d[2 * i] = (scalar[i] & 15) as i8;
+            d[2 * i + 1] = ((scalar[i] >> 4) & 15) as i8;
+        }
+        for i in 0..63 {
+            let c = (d[i] + 8) >> 4;
+            d[i] -= c << 4;
+            d[i + 1] += c;
+        }
+        Digits(d)
+    }
+}
 
 /// A batch's pipelines and their push constants, the view key's digits. Wiped on drop.
 struct Stages(Vec<(vk::Pipeline, [i32; 16])>);
@@ -33,8 +63,8 @@ impl Drop for Stages {
 const SPIRV: &[u8] = include_bytes!("../shaders/scan.spv");
 /// A key's working state on the GPU: 300 words.
 const STATE_BYTES: u64 = 300 * 4;
-/// A key's result: X, Y and Z, then whether it was off the curve.
-const OUT_WORDS: usize = 25;
+/// A key's result: the compressed point, then whether the key was off the curve.
+const OUT_WORDS: usize = 9;
 const CACHE_FILE: &str = "scan-gpu.cache";
 /// A submit taking this long means something's wrong: the driver's watchdog should have acted.
 const FENCE_TIMEOUT_NANOS: u64 = 60_000_000_000;
@@ -64,10 +94,34 @@ pub const DISCRETE_TUNING: Tuning = Tuning { submit_every: 8, ..TUNING };
 
 /// What went wrong, for the log. Never holds key material.
 #[derive(Debug)]
-pub struct GpuError(pub String);
+pub struct GpuError {
+    pub what: String,
+    pub kind: GpuErrorKind,
+}
+
+/// Whether there was a GPU to use at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuErrorKind {
+    /// No Vulkan loader or driver.
+    NoVulkan,
+    /// Vulkan, but no hardware GPU that can do this work.
+    NoGpu,
+    /// A GPU that went wrong.
+    Failed,
+}
+
+impl GpuError {
+    fn new(kind: GpuErrorKind, what: String) -> GpuError {
+        GpuError { what, kind }
+    }
+
+    fn failed(what: String) -> GpuError {
+        GpuError::new(GpuErrorKind::Failed, what)
+    }
+}
 
 fn failed(what: &str) -> impl Fn(vk::Result) -> GpuError + '_ {
-    move |e| GpuError(format!("{what}: {e}"))
+    move |e| GpuError::failed(format!("{what}: {e}"))
 }
 
 /// What the GPU worked out for a batch. Copied out whole first, as reading the
@@ -81,10 +135,17 @@ impl Points {
         Points(Zeroizing::new(words))
     }
 
-    /// Key `i`'s point, or `None` if the key wasn't on the curve.
-    pub fn get(&self, i: usize) -> Option<(Fe, Fe, Fe)> {
+    /// Key `i`'s point, compressed, or `None` if the key wasn't on the curve.
+    /// Wipe it when done: it's the key's shared secret with the wallet.
+    pub fn get(&self, i: usize) -> Option<[u8; 32]> {
         let word = &self.0[i * OUT_WORDS..(i + 1) * OUT_WORDS];
-        (word[24] == 0).then(|| (Fe::from_limbs(&word[0..8]), Fe::from_limbs(&word[8..16]), Fe::from_limbs(&word[16..24])))
+        (word[8] == 0).then(|| {
+            let mut bytes = [0; 32];
+            for (limb, out) in word[..8].iter().zip(bytes.as_chunks_mut::<4>().0) {
+                *out = limb.to_le_bytes();
+            }
+            bytes
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -184,9 +245,12 @@ impl Gpu {
 
     fn start_tuned(cache_dir: Option<PathBuf>, tuning: Option<Tuning>, any_kind: bool) -> Result<Gpu, GpuError> {
         unsafe {
-            let entry = ash::Entry::load().map_err(|e| GpuError(format!("no Vulkan: {e}")))?;
+            let entry = ash::Entry::load().map_err(|e| GpuError::new(GpuErrorKind::NoVulkan, format!("no Vulkan: {e}")))?;
             let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_0);
-            let instance = entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None).map_err(failed("instance"))?;
+            // Without a driver, the loader can't make an instance.
+            let instance = entry
+                .create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)
+                .map_err(|e| GpuError::new(GpuErrorKind::NoVulkan, format!("instance: {e}")))?;
             Self::on_instance(&entry, instance, cache_dir, tuning, any_kind)
         }
     }
@@ -267,7 +331,7 @@ impl Gpu {
                 .filter_map(|d| rank(instance.get_physical_device_properties(d).device_type).map(|r| (r, d)))
                 .min_by_key(|(r, _)| *r)
                 .map(|(_, d)| d)
-                .ok_or_else(|| GpuError("no GPU".into()))?;
+                .ok_or_else(|| GpuError::new(GpuErrorKind::NoGpu, "no GPU".into()))?;
             let properties = instance.get_physical_device_properties(physical);
             let name = CStr::from_ptr(properties.device_name.as_ptr()).to_string_lossy().into_owned();
             let limits = properties.limits;
@@ -276,13 +340,13 @@ impl Gpu {
                 || limits.max_compute_work_group_size[0] < tuning.group
                 || limits.max_push_constants_size < PUSH_BYTES
             {
-                return Err(GpuError(format!("{name} is too small for this work")));
+                return Err(GpuError::new(GpuErrorKind::NoGpu, format!("{name} is too small for this work")));
             }
             let family = instance
                 .get_physical_device_queue_family_properties(physical)
                 .iter()
                 .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE))
-                .ok_or_else(|| GpuError(format!("{name} has no compute queue")))? as u32;
+                .ok_or_else(|| GpuError::new(GpuErrorKind::NoGpu, format!("{name} has no compute queue")))? as u32;
             Ok((physical, family, name))
         }
     }
@@ -349,7 +413,7 @@ impl Gpu {
             let spec = vk::SpecializationInfo::default().map_entries(&entries).data(&bytes);
             let shader = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(self.module).name(c"main").specialization_info(&spec);
             let info = vk::ComputePipelineCreateInfo::default().stage(shader).layout(self.layout);
-            let made = self.device.create_compute_pipelines(self.cache, &[info], None).map_err(|e| GpuError(format!("pipeline: {}", e.1)))?;
+            let made = self.device.create_compute_pipelines(self.cache, &[info], None).map_err(|e| GpuError::failed(format!("pipeline: {}", e.1)))?;
             Ok(made[0])
         }
     }
@@ -386,7 +450,7 @@ impl Gpu {
                 }
             }
             self.device.destroy_buffer(buffer, None);
-            Err(GpuError(format!("no memory for {size} bytes")))
+            Err(GpuError::failed(format!("no memory for {size} bytes")))
         }
     }
 
@@ -457,7 +521,7 @@ impl Gpu {
                     for buffer in [&input, &state, &out] {
                         self.free(buffer);
                     }
-                    return Err(GpuError(format!("descriptor set: {e}")));
+                    return Err(GpuError::failed(format!("descriptor set: {e}")));
                 }
             };
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = [&input, &state, &out].iter().map(|b| [vk::DescriptorBufferInfo { buffer: b.buffer, offset: 0, range: vk::WHOLE_SIZE }]).collect();
