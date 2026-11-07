@@ -18,5 +18,9 @@ crypto-bigint = { version = "0.5", default-features = false }
 zeroize = "1"
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
 
+[target.'cfg(unix)'.dependencies]
+# For atexit: a process returning from main waits for a warm-up still in the driver.
+libc = "0.2"
+
 [dev-dependencies]
 rand = "0.8"

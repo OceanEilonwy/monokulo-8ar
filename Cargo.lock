@@ -396,6 +396,7 @@ dependencies = [
  "ash",
  "crypto-bigint",
  "curve25519-dalek",
+ "libc",
  "monero-wallet",
  "rand",
  "sha3",

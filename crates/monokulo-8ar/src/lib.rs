@@ -23,7 +23,7 @@ mod engine;
 pub mod gpu;
 mod vectors;
 
-pub use engine::{Engine, Reason, check_wallet, engine, gpu_failed, gpu_identity, gpu_ready, rest, set_cache_dir, warm_up};
+pub use engine::{Engine, Reason, check_wallet, engine, gpu_failed, gpu_identity, gpu_ready, rest, set_cache_dir, settle, warm_up};
 
 use std::{
     collections::HashSet,

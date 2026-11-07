@@ -3,9 +3,11 @@
 use std::{
     path::PathBuf,
     sync::{
-        Mutex, OnceLock,
+        Condvar, Mutex, OnceLock,
         atomic::{AtomicU8, Ordering},
     },
+    thread::JoinHandle,
+    time::Duration,
 };
 
 use zeroize::Zeroizing;
@@ -56,6 +58,14 @@ static CACHE_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GPU: OnceLock<Mutex<Option<Gpu>>> = OnceLock::new();
 /// The ready GPU's name, readable without waiting for a batch to finish.
 static NAME: OnceLock<String> = OnceLock::new();
+/// The warm-up thread, to join once it's done.
+static WARM_UP: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+/// Set by the warm-up thread as its last act, for [`settle`] to wait on.
+static DONE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+/// How long a process exiting waits for a warm-up still inside the driver.
+/// Only the first run of a cold cache compiles the shader (20–30 s); after
+/// that a warm-up is over in well under a second.
+const EXIT_WAIT: Duration = Duration::from_secs(60);
 
 /// Where compiled shaders are kept: an app's cache folder, say.
 pub fn set_cache_dir(dir: PathBuf) {
@@ -88,10 +98,60 @@ pub fn warm_up() {
             },
         };
         STATE.store(state, Ordering::Relaxed);
+        finished();
     });
-    if started.is_err() {
-        STATE.store(FAILED, Ordering::Relaxed);
+    match started {
+        Ok(handle) => {
+            *WARM_UP.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+            // A process that returns from main while this thread is still in
+            // the driver can crash in the driver's own teardown: wait for it.
+            #[cfg(unix)]
+            {
+                extern "C" fn at_exit() {
+                    settle(EXIT_WAIT);
+                }
+                // SAFETY: atexit takes a plain C function pointer and
+                // registers it; the handler touches only this module's
+                // statics, which outlive it.
+                unsafe {
+                    libc::atexit(at_exit);
+                }
+            }
+        }
+        Err(_) => {
+            STATE.store(FAILED, Ordering::Relaxed);
+            finished();
+        }
     }
+}
+
+fn finished() {
+    let (lock, signal) = &DONE;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    signal.notify_all();
+}
+
+/// Waits for the warm-up to finish, up to `timeout`, and joins its thread.
+/// True once it's finished, or if it was never started; false if it's still
+/// going when the time is up. A test binary or a server shutting down calls
+/// this first, so the process doesn't exit with the thread inside the
+/// driver. A process returning from `main` does the same on its own, for up
+/// to a minute.
+pub fn settle(timeout: Duration) -> bool {
+    if STATE.load(Ordering::Relaxed) == NOT_STARTED {
+        return true;
+    }
+    let (lock, signal) = &DONE;
+    let done = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (done, result) = signal.wait_timeout_while(done, timeout, |done| !*done).unwrap_or_else(|e| e.into_inner());
+    if result.timed_out() && !*done {
+        return false;
+    }
+    drop(done);
+    if let Some(handle) = WARM_UP.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = handle.join();
+    }
+    true
 }
 
 /// What's doing the work now.
@@ -185,5 +245,26 @@ pub(crate) fn derive(digits: &Digits, keys: &[[u8; 32]]) -> Option<Points> {
             retire(&mut gpu);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With or without a GPU: before a warm-up there is nothing to wait for,
+    /// and after one `settle` returns once the thread is done, leaving the
+    /// engine in a state past `Starting`.
+    #[test]
+    fn settle_waits_for_the_warm_up_and_no_longer() {
+        if STATE.load(Ordering::Relaxed) == NOT_STARTED {
+            assert!(settle(Duration::from_millis(1)), "nothing started, nothing to wait for");
+        }
+        warm_up();
+        assert!(settle(Duration::from_secs(120)), "the warm-up thread ended");
+        assert_ne!(engine(), Engine::Cpu { reason: Reason::Starting });
+        assert_ne!(engine(), Engine::Cpu { reason: Reason::NotStarted });
+        assert!(settle(Duration::from_millis(1)), "and asking again costs nothing");
+        assert!(WARM_UP.lock().unwrap().is_none(), "the thread was joined");
     }
 }
