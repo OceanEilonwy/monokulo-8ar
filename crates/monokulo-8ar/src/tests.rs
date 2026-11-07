@@ -1,0 +1,417 @@
+use curve25519_dalek::edwards::CompressedEdwardsY;
+use monero_wallet::{
+    Scanner,
+    block::{Block, BlockHeader},
+    ed25519::{Point, Scalar as MoneroScalar},
+    transaction::{Input, Output, Timelock, Pruned},
+};
+use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+
+use super::*;
+
+/// Fob's choice of where Auto hands over to the GPU, for the tests.
+const GPU_FROM: usize = 512;
+
+fn random_scalar(rng: &mut StdRng) -> Scalar {
+    let mut bytes = [0; 64];
+    rng.fill_bytes(&mut bytes);
+    Scalar::from_bytes_mod_order_wide(&bytes)
+}
+
+fn dalek_derivation(view: &Scalar, r: &EdwardsPoint) -> [u8; 32] {
+    (view * r).mul_by_cofactor().compress().to_bytes()
+}
+
+fn custom_derivations(view: &Scalar, keys: &[[u8; 32]]) -> Vec<Option<[u8; 32]>> {
+    let digits = fe::Digits::new(&view.to_bytes());
+    let decompressed: Vec<_> = keys.iter().map(fe::Ext::decompress).collect();
+    let points: Vec<_> = decompressed.iter().flatten().map(|r| fe::mul8(&digits, r)).collect();
+    let mut compressed = vec![];
+    fe::compress_batch(&points, &mut compressed);
+    let mut done = compressed.into_iter();
+    decompressed.iter().map(|r| r.as_ref().map(|_| done.next().unwrap())).collect()
+}
+
+/// The eight points of small order, on which curve code tends to go wrong.
+fn small_order() -> Vec<[u8; 32]> {
+    use curve25519_dalek::constants::EIGHT_TORSION;
+    EIGHT_TORSION.iter().map(|p| p.compress().to_bytes()).collect()
+}
+
+#[test]
+fn the_field_agrees_with_dalek_on_random_points_in_a_batch() {
+    let mut rng = StdRng::seed_from_u64(1);
+    for _ in 0..40 {
+        let view = random_scalar(&mut rng);
+        let points: Vec<EdwardsPoint> = (0..64).map(|_| &random_scalar(&mut rng) * ED25519_BASEPOINT_TABLE).collect();
+        let keys: Vec<[u8; 32]> = points.iter().map(|p| p.compress().to_bytes()).collect();
+        let ours = custom_derivations(&view, &keys);
+        for (p, got) in points.iter().zip(ours) {
+            assert_eq!(got, Some(dalek_derivation(&view, p)));
+        }
+    }
+}
+
+#[test]
+fn the_field_agrees_with_dalek_on_small_order_and_torsioned_points() {
+    let mut rng = StdRng::seed_from_u64(2);
+    let view = random_scalar(&mut rng);
+    let mut points: Vec<EdwardsPoint> = vec![];
+    for torsion in curve25519_dalek::constants::EIGHT_TORSION {
+        points.push(torsion);
+        points.push(&random_scalar(&mut rng) * ED25519_BASEPOINT_TABLE + torsion);
+    }
+    let keys: Vec<[u8; 32]> = points.iter().map(|p| p.compress().to_bytes()).collect();
+    for (p, got) in points.iter().zip(custom_derivations(&view, &keys)) {
+        assert_eq!(got, Some(dalek_derivation(&view, p)));
+    }
+    assert_eq!(small_order().len(), 8);
+}
+
+#[test]
+fn extreme_view_keys_agree_with_dalek() {
+    let mut rng = StdRng::seed_from_u64(3);
+    let mut most = (Scalar::ZERO - Scalar::ONE).to_bytes();
+    let top = Scalar::from_bytes_mod_order(most);
+    most[0] = 0;
+    for view in [Scalar::ZERO, Scalar::ONE, Scalar::from(8u8), top, Scalar::from_bytes_mod_order(most)] {
+        let p = &random_scalar(&mut rng) * ED25519_BASEPOINT_TABLE;
+        assert_eq!(custom_derivations(&view, &[p.compress().to_bytes()])[0], Some(dalek_derivation(&view, &p)));
+    }
+}
+
+/// Exactly the encodings monero-oxide takes, whatever the bytes.
+#[test]
+fn decompressing_takes_exactly_what_monero_oxide_takes() {
+    let check = |bytes: [u8; 32]| {
+        let theirs = CompressedPoint::from(bytes).decompress();
+        let ours = fe::Ext::decompress(&bytes);
+        assert_eq!(theirs.is_some(), ours.is_some(), "{bytes:?}");
+        if ours.is_some() {
+            let view = Scalar::from(3u8);
+            let dalek: EdwardsPoint = theirs.unwrap().into();
+            assert_eq!(custom_derivations(&view, &[bytes])[0], Some(dalek_derivation(&view, &dalek)));
+        }
+    };
+    let mut rng = StdRng::seed_from_u64(4);
+    for _ in 0..3000 {
+        let mut bytes = [0; 32];
+        rng.fill_bytes(&mut bytes);
+        check(bytes);
+    }
+    // y at and past p, negative zeros, and each small-order point with its sign flipped.
+    let mut p = [0xff; 32];
+    p[0] = 0xed;
+    p[31] = 0x7f;
+    for low in 0..=40u8 {
+        let mut near = p;
+        near[0] = 0xed_u8.wrapping_add(low);
+        if low >= 19 {
+            near[0] = low - 19;
+            near[1..31].fill(0);
+            near[31] = 0;
+        }
+        check(near);
+        near[31] |= 0x80;
+        check(near);
+    }
+    check([0xff; 32]);
+    for point in small_order() {
+        let mut flipped = point;
+        flipped[31] ^= 0x80;
+        check(point);
+        check(flipped);
+    }
+    assert!(CompressedEdwardsY(small_order()[0]).decompress().is_some());
+}
+
+// Blocks made to pay a wallet, or nearly: each is held to the Scanner's own answer.
+
+struct Wallet {
+    view: Scalar,
+    spend: EdwardsPoint,
+    pair: ViewPair,
+}
+
+const SUBADDRESS: u32 = 5;
+
+fn wallet() -> (Wallet, Prefilter, Scanner) {
+    let view_bytes = Zeroizing::new([9u8; 32]);
+    let view_monero = MoneroScalar::read(&mut view_bytes.as_slice()).unwrap();
+    let view: Scalar = view_monero.into();
+    let spend = &Scalar::from(7u64) * ED25519_BASEPOINT_TABLE;
+    let pair = ViewPair::new(Point::from(spend), Zeroizing::new(view_monero)).unwrap();
+    let mut filter = Prefilter::new(&pair, &view_bytes);
+    let mut scanner = Scanner::new(pair.clone());
+    let index = SubaddressIndex::new(0, SUBADDRESS).unwrap();
+    filter.watch(&pair, index);
+    scanner.register_subaddress(index);
+    (Wallet { view, spend, pair }, filter, scanner)
+}
+
+/// An output of the transaction with key `r`, at `index`, paying `to`.
+fn paying(wallet: &Wallet, r: &Scalar, index: usize, to: EdwardsPoint) -> Output {
+    let derivation = dalek_derivation(&wallet.view, &(r * ED25519_BASEPOINT_TABLE));
+    let mut tagged = b"view_tag".to_vec();
+    tagged.extend_from_slice(&derivation);
+    varint(index, &mut tagged);
+    let mut shared = derivation.to_vec();
+    varint(index, &mut shared);
+    let shared = Scalar::from_bytes_mod_order(Keccak256::digest(&shared).into());
+    let key = &shared * ED25519_BASEPOINT_TABLE + to;
+    Output { amount: Some(1_000), key: CompressedPoint::from(key.compress().to_bytes()), view_tag: Some(Keccak256::digest(&tagged)[0]) }
+}
+
+fn stranger(rng: &mut StdRng) -> Output {
+    let key = &random_scalar(rng) * ED25519_BASEPOINT_TABLE;
+    Output { amount: Some(1_000), key: CompressedPoint::from(key.compress().to_bytes()), view_tag: Some(rng.r#gen()) }
+}
+
+fn extra_of(keys: &[[u8; 32]], additional: Option<&[[u8; 32]]>) -> Vec<u8> {
+    let mut extra = vec![];
+    for key in keys {
+        extra.push(1);
+        extra.extend_from_slice(key);
+    }
+    if let Some(list) = additional {
+        extra.push(4);
+        extra.push(list.len() as u8);
+        for key in list {
+            extra.extend_from_slice(key);
+        }
+    }
+    extra
+}
+
+fn point_of(r: &Scalar) -> [u8; 32] {
+    (r * ED25519_BASEPOINT_TABLE).compress().to_bytes()
+}
+
+fn block_of(outputs: Vec<Output>, extra: Vec<u8>) -> ScannableBlock {
+    block_with(outputs, extra, 16, 0)
+}
+
+fn block_with(outputs: Vec<Output>, extra: Vec<u8>, fork: u8, version: u8) -> ScannableBlock {
+    let prefix = TransactionPrefix { additional_timelock: Timelock::None, inputs: vec![Input::Gen(100)], outputs, extra };
+    let miner = if version == 1 { Transaction::V1 { prefix, signatures: vec![] } } else { Transaction::V2 { prefix, proofs: None } };
+    let header = BlockHeader { hardfork_version: fork, hardfork_signal: fork, timestamp: 1, previous: [0; 32], nonce: 0 };
+    ScannableBlock { block: Block::new(header, miner, vec![]).unwrap(), transactions: vec![], output_index_for_first_ringct_output: Some(0) }
+}
+
+fn scanner_finds(scanner: &Scanner, block: ScannableBlock) -> bool {
+    match scanner.clone().scan(block) {
+        Ok(found) => !found.ignore_additional_timelock().is_empty(),
+        Err(_) => true,
+    }
+}
+
+fn agree(name: &str, filter: &Prefilter, scanner: &Scanner, block: ScannableBlock, expected: bool) {
+    assert_eq!(scanner_finds(scanner, block.clone()), expected, "{name}: the Scanner's answer isn't the one this case is about");
+    assert_eq!(filter.flag(std::slice::from_ref(&block), 1, true, GPU_FROM)[0], expected, "{name}");
+}
+
+#[test]
+fn every_way_of_being_paid_is_flagged_and_strangers_are_not() {
+    every_way_of_being_paid();
+}
+
+/// The same on the GPU, chosen and through Auto. Needs a real GPU: the
+/// mode is global, so it's kept from the other tests.
+#[test]
+#[ignore = "needs a GPU; run with --ignored"]
+fn the_gpu_flags_the_same_blocks() {
+    set_mode(Mode::Gpu);
+    for _ in 0..1200 {
+        if engine::gpu_ready() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(engine::gpu_ready(), "the GPU started");
+    every_way_of_being_paid();
+    many_blocks();
+    set_mode(Mode::Auto);
+    let (_, filter, _) = wallet();
+    let mut rng = StdRng::seed_from_u64(8);
+    // Enough keys for Auto to choose the GPU, and for more than one of its batches.
+    let (w, _, _) = wallet();
+    let mut blocks = vec![];
+    let mut expected = vec![];
+    for i in 0..(crate::gpu::TUNING.batch + 300) {
+        let r = random_scalar(&mut rng);
+        let pays = i % 500 == 3;
+        let output = if pays { paying(&w, &r, 0, w.spend) } else { stranger(&mut rng) };
+        blocks.push(block_of(vec![output], extra_of(&[point_of(&r)], None)));
+        expected.push(pays);
+    }
+    assert_eq!(filter.flag(&blocks, 4, true, GPU_FROM), expected);
+    assert!(engine::gpu_ready(), "and it hasn't been retired");
+    set_mode(Mode::Cpu);
+    assert_eq!(filter.flag(&blocks, 4, true, GPU_FROM), expected);
+}
+
+fn every_way_of_being_paid() {
+    let (w, filter, scanner) = wallet();
+    let mut rng = StdRng::seed_from_u64(5);
+    let r = random_scalar(&mut rng);
+    let sub = w.pair.subaddress(Network::Mainnet, SubaddressIndex::new(0, SUBADDRESS).unwrap()).spend();
+    let sub: EdwardsPoint = sub.into();
+    let unwatched: EdwardsPoint = w.pair.subaddress(Network::Mainnet, SubaddressIndex::new(0, SUBADDRESS + 1).unwrap()).spend().into();
+    let key = point_of(&r);
+
+    agree("primary, first output", &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[key], None)), true);
+    agree("primary, later output", &filter, &scanner, block_of(vec![stranger(&mut rng), stranger(&mut rng), paying(&w, &r, 2, w.spend)], extra_of(&[key], None)), true);
+    agree("subaddress", &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, sub)], extra_of(&[key], None)), true);
+    agree("unwatched subaddress", &filter, &scanner, block_of(vec![paying(&w, &r, 0, unwatched)], extra_of(&[key], None)), false);
+    agree("a stranger", &filter, &scanner, block_of(vec![stranger(&mut rng)], extra_of(&[key], None)), false);
+
+    // The tag's a filter, and absent on old outputs.
+    let mut no_tag = paying(&w, &r, 0, w.spend);
+    no_tag.view_tag = None;
+    agree("no view tag", &filter, &scanner, block_of(vec![no_tag], extra_of(&[key], None)), true);
+    let mut wrong_tag = paying(&w, &r, 0, w.spend);
+    wrong_tag.view_tag = Some(wrong_tag.view_tag.unwrap().wrapping_add(1));
+    agree("wrong view tag", &filter, &scanner, block_of(vec![wrong_tag], extra_of(&[key], None)), false);
+
+    // Several keys, and additional keys, each with its own output.
+    let other = random_scalar(&mut rng);
+    agree("second key", &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[point_of(&other), key], None)), true);
+    let additional = [point_of(&other), key];
+    agree("additional key", &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], extra_of(&[point_of(&other)], Some(&additional))), true);
+    let swapped = [key, point_of(&other)];
+    agree("additional key on another output", &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], extra_of(&[point_of(&other)], Some(&swapped))), false);
+    let mut twice = extra_of(&[point_of(&other)], Some(&[point_of(&other), point_of(&other)]));
+    twice.extend_from_slice(&extra_of(&[], Some(&additional))[..]);
+    agree("only the first list of additional keys", &filter, &scanner, block_of(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], twice), false);
+    agree("additional keys and no key", &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[], Some(&[key]))), false);
+
+    // Bad keys count as the identity, as they do for Monero: with the identity's
+    // derivation, money can be paid to one.
+    let mut bad = [0xff; 32];
+    bad[31] = 0x7f;
+    assert!(CompressedPoint::from(bad).decompress().is_none());
+    let zero = Scalar::ZERO;
+    let identity_pays = |rng: &mut StdRng| block_of(vec![stranger(rng), paying(&w, &zero, 1, w.spend)], extra_of(&[bad], None));
+    agree("a badly encoded key", &filter, &scanner, identity_pays(&mut rng), true);
+
+    // Output keys that can't be scanned.
+    let mut identity_out = stranger(&mut rng);
+    identity_out.key = CompressedPoint::IDENTITY;
+    agree("identity output", &filter, &scanner, block_of(vec![identity_out], extra_of(&[key], None)), false);
+    let mut undecodable = stranger(&mut rng);
+    undecodable.key = CompressedPoint::from(bad);
+    undecodable.view_tag = None;
+    agree("undecodable output", &filter, &scanner, block_of(vec![undecodable], extra_of(&[key], None)), false);
+
+    // Not scanned at all.
+    agree("v1 transaction", &filter, &scanner, block_with(vec![paying(&w, &r, 0, w.spend)], extra_of(&[key], None), 16, 1), false);
+    agree("unreadable extra", &filter, &scanner, block_of(vec![paying(&w, &r, 0, w.spend)], vec![0x77, 1, 2, 3]), false);
+    let mut no_ringct = block_of(vec![paying(&w, &r, 0, w.spend)], extra_of(&[key], None));
+    no_ringct.output_index_for_first_ringct_output = None;
+    agree("no RingCT outputs", &filter, &scanner, no_ringct, false);
+
+    // The Scanner's refusals stay the Scanner's to make.
+    agree("a newer fork", &filter, &scanner, block_with(vec![stranger(&mut rng)], extra_of(&[key], None), NEWEST_FORK + 1, 0), true);
+    let mut mismatched = block_of(vec![stranger(&mut rng)], extra_of(&[key], None));
+    mismatched.block = Block::new(mismatched.block.header.clone(), mismatched.block.miner_transaction().clone(), vec![[1; 32]]).unwrap();
+    agree("transactions missing", &filter, &scanner, mismatched, true);
+}
+
+#[test]
+fn payments_in_ordinary_transactions_are_flagged_among_many_blocks() {
+    many_blocks();
+}
+
+fn many_blocks() {
+    let (w, filter, scanner) = wallet();
+    let mut rng = StdRng::seed_from_u64(6);
+    let mut blocks = vec![];
+    let mut expected = vec![];
+    for i in 0..300u32 {
+        let mut block = block_of(vec![stranger(&mut rng)], extra_of(&[point_of(&random_scalar(&mut rng))], None));
+        let pays = i % 37 == 0;
+        for t in 0..3 {
+            let r = random_scalar(&mut rng);
+            let outputs = if pays && t == 1 { vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)] } else { vec![stranger(&mut rng), stranger(&mut rng)] };
+            let prefix = TransactionPrefix { additional_timelock: Timelock::None, inputs: vec![], outputs, extra: extra_of(&[point_of(&r)], None) };
+            block.transactions.push(Transaction::<Pruned>::V2 { prefix, proofs: None });
+        }
+        let hashes = vec![[0; 32]; block.transactions.len()];
+        block.block = Block::new(block.block.header.clone(), block.block.miner_transaction().clone(), hashes).unwrap();
+        expected.push(pays);
+        blocks.push(block);
+    }
+    assert_eq!(filter.flag(&blocks, 4, true, GPU_FROM), expected);
+    assert_eq!(filter.flag(&blocks, 1, true, GPU_FROM), expected);
+    for (block, pays) in blocks.into_iter().zip(expected) {
+        assert_eq!(scanner_finds(&scanner, block), pays, "the Scanner has the same answer");
+    }
+}
+
+/// Whatever's in a transaction's extra, the keys read are `Extra::keys`' keys.
+#[test]
+fn encoded_keys_are_the_keys_extra_gives() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let same = |bytes: &[u8]| {
+        let Ok(extra) = Extra::read(&mut &bytes[..]) else { return };
+        let identity = CompressedPoint::IDENTITY.to_bytes();
+        let cleaned = |key: &[u8; 32]| if CompressedPoint::from(*key).decompress().is_some() { *key } else { identity };
+        let ours = encoded_keys(&extra).map(|(keys, more)| (keys.iter().map(cleaned).collect::<Vec<_>>(), more.map(|m| m.iter().map(cleaned).collect::<Vec<_>>())));
+        let theirs = extra.keys().map(|(keys, more)| {
+            let bytes = |list: Vec<Point>| list.into_iter().map(|k| k.compress().to_bytes()).collect::<Vec<_>>();
+            (bytes(keys), more.map(bytes))
+        });
+        assert_eq!(ours, theirs, "{bytes:?}");
+    };
+    let key = |rng: &mut StdRng| point_of(&random_scalar(rng));
+    for _ in 0..500 {
+        // Fields in any order, with nonces and padding about.
+        let mut bytes = vec![];
+        for _ in 0..rng.gen_range(0..6) {
+            match rng.gen_range(0..4) {
+                0 => {
+                    bytes.push(1);
+                    let k = key(&mut rng);
+                    bytes.extend_from_slice(&k);
+                }
+                1 => {
+                    let n = rng.gen_range(0..4);
+                    bytes.push(4);
+                    bytes.push(n);
+                    for _ in 0..n {
+                        let k = key(&mut rng);
+                        bytes.extend_from_slice(&k);
+                    }
+                }
+                2 => {
+                    let n = rng.gen_range(0..40);
+                    bytes.push(2);
+                    bytes.push(n);
+                    for _ in 0..n {
+                        bytes.push(rng.r#gen());
+                    }
+                }
+                _ => {
+                    let mut bad = [0xff; 33];
+                    bad[0] = 1;
+                    bad[32] = 0x7f;
+                    bytes.extend_from_slice(&bad);
+                }
+            }
+        }
+        same(&bytes);
+    }
+    // More keys than a one-byte count holds.
+    let mut many = vec![4, 0x90, 0x01];
+    for _ in 0..144 {
+        let k = key(&mut rng);
+        many.extend_from_slice(&k);
+    }
+    same(&many);
+    // Random bytes that happen to parse.
+    for _ in 0..3000 {
+        let mut bytes = vec![0; rng.gen_range(0..80)];
+        rng.fill_bytes(&mut bytes);
+        same(&bytes);
+    }
+}

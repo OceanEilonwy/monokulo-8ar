@@ -1,0 +1,22 @@
+[package]
+name = "monokulo-8ar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Computes 8aR for many Monero transaction keys at once, on the GPU or the CPU, and flags the blocks that may pay a wallet."
+
+[lib]
+name = "monokulo_8ar"
+
+[dependencies]
+monero-wallet = "0.2"
+curve25519-dalek = { version = "4", features = ["precomputed-tables"] }
+sha3 = "0.10"
+subtle = "2"
+zeroize = "1"
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+
+[dev-dependencies]
+rand = "0.8"

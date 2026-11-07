@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Each prototype is a workspace of its own, kept for the record.
+exclude = ["prototypes"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-only"
+version = "0.1.0"
+repository = "https://github.com/OceanEilonwy/monokulo-8ar"
+
+# monero-oxide's cryptography is unusably slow unoptimised, even in tests.
+[profile.dev.package."*"]
+opt-level = 3
