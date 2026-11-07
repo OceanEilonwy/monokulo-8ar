@@ -10,7 +10,7 @@
 
 use curve25519_dalek::{Scalar, constants::ED25519_BASEPOINT_TABLE, constants::EIGHT_TORSION, edwards::{CompressedEdwardsY, EdwardsPoint}};
 use crypto_bigint::{Encoding, U256, U512};
-use monokulo_8ar::gpu::{Digits, Gpu, TUNING, Tuning};
+use monokulo_8ar::gpu::{Arena, Device, Digits, TUNING, Tuning};
 
 const P_BIG: U256 = U256::from_be_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed");
 
@@ -111,7 +111,7 @@ fn to_limbs(bytes: [u8; 32]) -> [u32; 8] {
     std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
 }
 
-fn field(gpu: &Gpu, rng: &mut Rng) -> u64 {
+fn field(gpu: &Arena, rng: &mut Rng) -> u64 {
     let values = awkward();
     let mut pairs = vec![];
     for a in &values {
@@ -126,7 +126,7 @@ fn field(gpu: &Gpu, rng: &mut Rng) -> u64 {
     for op in 0..6 {
         let mut at = 0;
         for chunk in pairs.chunks(gpu.tuning().batch) {
-            let got = gpu.check_field(op, chunk).expect("the GPU ran");
+            let got = gpu.check_field(op as u32, chunk).expect("the GPU ran");
             for (i, (a, b)) in chunk.iter().enumerate() {
                 assert_eq!(got[i], field_answer(op, a, b), "field op {op} at {} on {a:x?} {b:x?}", at + i);
                 checked += 1;
@@ -142,9 +142,9 @@ enum Want {
     OffCurve,
 }
 
-fn compare(gpu: &Gpu, view: &Scalar, keys: &[[u8; 32]], wants: &[Want], what: &str) {
+fn compare(gpu: &Arena, view: &Scalar, keys: &[[u8; 32]], wants: &[Want], what: &str) {
     let digits = Digits::new(&view.to_bytes());
-    let got = gpu.derive(&digits, keys).expect("the GPU ran");
+    let got = gpu.derive(&[&digits], keys).expect("the GPU ran");
     assert_eq!(got.len(), keys.len());
     for (i, want) in wants.iter().enumerate() {
         match (got.get(i), want) {
@@ -221,7 +221,8 @@ fn main() {
     };
     let rounds = arg(&args, "--rounds", 3);
     let started = std::time::Instant::now();
-    let gpu = Gpu::start(None, tuning, args.iter().any(|a| a == "--any")).expect("a GPU");
+    let device = Device::start(None, tuning, args.iter().any(|a| a == "--any")).expect("a GPU");
+    let gpu = Arena::new(&device).expect("an arena");
     println!("{}, {tuning:?}, started in {:.1} s", gpu.name(), started.elapsed().as_secs_f64());
     let t = std::time::Instant::now();
     println!("the startup vectors: {:?}, {:.3} s", monokulo_8ar::startup_vectors(&gpu), t.elapsed().as_secs_f64());

@@ -25,23 +25,71 @@ fn small_order() -> Vec<[u8; 32]> {
     EIGHT_TORSION.iter().map(|p| p.compress().to_bytes()).collect()
 }
 
-/// What a sound GPU hands back for `keys`, worked out by curve25519-dalek.
+/// What a sound GPU hands back for `key` with `view`, worked out by curve25519-dalek.
+fn dalek_words(view: &Scalar, key: &[u8; 32], words: &mut Vec<u32>) {
+    match CompressedEdwardsY(*key).decompress() {
+        Some(r) => {
+            let bytes = dalek_derivation(view, &r);
+            words.extend(bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)));
+            words.push(0);
+        }
+        None => {
+            words.extend([0; 8]);
+            words.push(1);
+        }
+    }
+}
+
 fn dalek_points(view: &Scalar, keys: &[[u8; 32]]) -> gpu::Points {
     let mut words = vec![];
     for key in keys {
-        match CompressedEdwardsY(*key).decompress() {
-            Some(r) => {
-                let bytes = dalek_derivation(view, &r);
-                words.extend(bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)));
-                words.push(0);
-            }
-            None => {
-                words.extend([0; 8]);
-                words.push(1);
-            }
-        }
+        dalek_words(view, key, &mut words);
     }
     gpu::Points::from_words(words)
+}
+
+/// curve25519-dalek in the GPU's place, for a keyring whose accounts' view keys
+/// are `views`, in slabs of `batch` items.
+struct OnDalek {
+    views: Vec<Scalar>,
+    keys: Vec<[u8; 32]>,
+    batch: usize,
+}
+
+impl OnDalek {
+    fn new(views: &[Scalar], batch: usize) -> OnDalek {
+        OnDalek { views: views.to_vec(), keys: vec![], batch }
+    }
+}
+
+impl Deriver for OnDalek {
+    fn batch(&self) -> usize {
+        self.batch
+    }
+
+    fn load(&mut self, accounts: &[&gpu::Digits], keys: &[[u8; 32]]) -> Result<(), GpuError> {
+        assert_eq!(accounts.len(), self.views.len(), "a view key for each account");
+        self.keys = keys.to_vec();
+        Ok(())
+    }
+
+    fn slab(&mut self, first_item: u64, count: usize) -> Result<gpu::Points, GpuError> {
+        assert!(count <= self.batch);
+        let mut words = vec![];
+        for item in first_item as usize..first_item as usize + count {
+            dalek_words(&self.views[item / self.keys.len()], &self.keys[item % self.keys.len()], &mut words);
+        }
+        Ok(gpu::Points::from_words(words))
+    }
+
+    fn unload(&mut self) {
+        self.keys.clear();
+    }
+}
+
+/// A keyring's hits with curve25519-dalek doing the GPU's part.
+fn dalek_hits(keyring: &Keyring, views: &[Scalar], blocks: &[ScannableBlock], threads: usize, batch: usize) -> Vec<Hit> {
+    keyring.flag_by(blocks, threads, 0, &mut OnDalek::new(views, batch)).expect("dalek doesn't fail").expect("it filtered")
 }
 
 /// How a test has blocks flagged: the GPU, or curve25519-dalek in its place.
@@ -50,7 +98,7 @@ type Flagger = fn(&Prefilter, &Scalar, &[ScannableBlock], usize) -> Vec<bool>;
 /// The prefilter with curve25519-dalek doing the GPU's part, in batches of 100
 /// keys so that a few blocks take several.
 fn by_dalek(filter: &Prefilter, view: &Scalar, blocks: &[ScannableBlock], threads: usize) -> Vec<bool> {
-    filter.flag_with(blocks, threads, 0, 100, |keys| Some(dalek_points(view, keys))).expect("it filtered")
+    flags(&dalek_hits(&filter.0, &[*view], blocks, threads, 100), blocks.len())
 }
 
 fn by_gpu(filter: &Prefilter, _view: &Scalar, blocks: &[ScannableBlock], threads: usize) -> Vec<bool> {
@@ -315,6 +363,17 @@ fn payments_in_ordinary_transactions_are_flagged_among_many_blocks() {
 
 fn many_blocks(flag: Flagger) {
     let (w, filter, scanner) = wallet();
+    let (blocks, expected) = many_blocks_for(&w);
+    assert_eq!(flag(&filter, &w.view, &blocks, 4), expected);
+    assert_eq!(flag(&filter, &w.view, &blocks, 1), expected);
+    for (block, pays) in blocks.into_iter().zip(expected) {
+        assert_eq!(scanner_finds(&scanner, block), pays, "the Scanner has the same answer");
+    }
+}
+
+/// 300 blocks of three ordinary transactions and a miner's, every 37th paying
+/// `w` in its second transaction; and which pay.
+fn many_blocks_for(w: &Wallet) -> (Vec<ScannableBlock>, Vec<bool>) {
     let mut rng = StdRng::seed_from_u64(6);
     let mut blocks = vec![];
     let mut expected = vec![];
@@ -323,7 +382,7 @@ fn many_blocks(flag: Flagger) {
         let pays = i % 37 == 0;
         for t in 0..3 {
             let r = random_scalar(&mut rng);
-            let outputs = if pays && t == 1 { vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)] } else { vec![stranger(&mut rng), stranger(&mut rng)] };
+            let outputs = if pays && t == 1 { vec![stranger(&mut rng), paying(w, &r, 1, w.spend)] } else { vec![stranger(&mut rng), stranger(&mut rng)] };
             let prefix = TransactionPrefix { additional_timelock: Timelock::None, inputs: vec![], outputs, extra: extra_of(&[point_of(&r)], None) };
             block.transactions.push(Transaction::<Pruned>::V2 { prefix, proofs: None });
         }
@@ -332,11 +391,130 @@ fn many_blocks(flag: Flagger) {
         expected.push(pays);
         blocks.push(block);
     }
-    assert_eq!(flag(&filter, &w.view, &blocks, 4), expected);
-    assert_eq!(flag(&filter, &w.view, &blocks, 1), expected);
-    for (block, pays) in blocks.into_iter().zip(expected) {
-        assert_eq!(scanner_finds(&scanner, block), pays, "the Scanner has the same answer");
+    (blocks, expected)
+}
+
+/// The blocks a keyring is tried on: `many_blocks_for`'s, then one paying the
+/// subaddress through an additional key in its miner transaction, and one of a
+/// newer fork, which every account must read whole.
+fn keyring_blocks(w: &Wallet) -> Vec<ScannableBlock> {
+    let (mut blocks, _) = many_blocks_for(w);
+    let mut rng = StdRng::seed_from_u64(11);
+    let r = random_scalar(&mut rng);
+    let sub: EdwardsPoint = w.pair.subaddress(Network::Mainnet, SubaddressIndex::new(0, SUBADDRESS).unwrap()).spend().into();
+    let other = point_of(&random_scalar(&mut rng));
+    blocks.push(block_of(vec![stranger(&mut rng), paying(w, &r, 1, sub)], extra_of(&[other], Some(&[other, point_of(&r)]))));
+    blocks.push(block_with(vec![stranger(&mut rng)], extra_of(&[other], None), NEWEST_FORK + 1, 0));
+    blocks
+}
+
+/// A keyring of `n` copies of the test wallet.
+fn copies(w: &Wallet, n: usize) -> Keyring {
+    let mut keyring = Keyring::new();
+    for _ in 0..n {
+        let id = keyring.add(&w.pair, &Zeroizing::new(w.view.to_bytes()));
+        keyring.watch(id, &w.pair, SubaddressIndex::new(0, SUBADDRESS).unwrap());
     }
+    keyring
+}
+
+/// `hits` that are `account`'s, as account 0's.
+fn of_account(hits: &[Hit], account: usize) -> Vec<Hit> {
+    hits.iter().filter(|h| h.account.index() == account).map(|h| Hit { account: AccountId(0), ..*h }).collect()
+}
+
+fn copies_flag_what_one_flags(hits_of: impl Fn(&Keyring, &[Scalar], &[ScannableBlock]) -> Vec<Hit>) {
+    let (w, _, _) = wallet();
+    let blocks = keyring_blocks(&w);
+    let one = hits_of(&copies(&w, 1), &[w.view], &blocks);
+    let (_, mut expected) = many_blocks_for(&w);
+    expected.extend([true, true]);
+    assert_eq!(flags(&one, blocks.len()), expected, "one key flags the blocks that pay it");
+    let last = blocks.len() - 1;
+    assert!(one.contains(&Hit { account: AccountId(0), block: last, tx: Hit::WHOLE_BLOCK }), "the newer fork, whole");
+    assert!(one.contains(&Hit { account: AccountId(0), block: last - 1, tx: 0 }), "the miner transaction's additional key");
+    assert!(one.contains(&Hit { account: AccountId(0), block: 0, tx: 2 }), "an ordinary transaction, by its place");
+    for n in [3, 50] {
+        let views = vec![w.view; n];
+        let many = hits_of(&copies(&w, n), &views, &blocks);
+        assert_eq!(many.len(), one.len() * n, "{n} copies");
+        for account in 0..n {
+            assert_eq!(of_account(&many, account), one, "copy {account} of {n}");
+        }
+    }
+}
+
+#[test]
+fn a_keyring_of_copies_flags_what_one_key_flags() {
+    copies_flag_what_one_flags(|keyring, views, blocks| dalek_hits(keyring, views, blocks, 4, 1000));
+}
+
+/// Accounts that aren't paid see only the block they must read whole, and the
+/// one that is paid sees its own hits, whatever its place.
+fn each_account_has_its_own_hits(hits_of: impl Fn(&Keyring, &[Scalar], &[ScannableBlock]) -> Vec<Hit>) {
+    let (w, _, _) = wallet();
+    let blocks = keyring_blocks(&w);
+    let one = hits_of(&copies(&w, 1), &[w.view], &blocks);
+    let mut rng = StdRng::seed_from_u64(12);
+    let mut keyring = Keyring::new();
+    let mut views = vec![];
+    for i in 0..5 {
+        let (pair, view) = if i == 3 {
+            (w.pair.clone(), w.view)
+        } else {
+            let view = random_scalar(&mut rng);
+            let spend = &random_scalar(&mut rng) * ED25519_BASEPOINT_TABLE;
+            (ViewPair::new(Point::from(spend), Zeroizing::new(MoneroScalar::read(&mut view.to_bytes().as_slice()).unwrap())).unwrap(), view)
+        };
+        let id = keyring.add(&pair, &Zeroizing::new(view.to_bytes()));
+        keyring.watch(id, &pair, SubaddressIndex::new(0, SUBADDRESS).unwrap());
+        views.push(view);
+    }
+    let hits = hits_of(&keyring, &views, &blocks);
+    assert_eq!(of_account(&hits, 3), one, "the wallet's own");
+    for stranger in [0, 1, 2, 4] {
+        assert_eq!(of_account(&hits, stranger), [Hit { account: AccountId(0), block: blocks.len() - 1, tx: Hit::WHOLE_BLOCK }], "account {stranger}");
+    }
+}
+
+#[test]
+fn each_account_in_a_keyring_has_its_own_hits() {
+    each_account_has_its_own_hits(|keyring, views, blocks| dalek_hits(keyring, views, blocks, 2, 333));
+}
+
+#[test]
+fn a_keyring_with_no_accounts_or_too_few_keys() {
+    let (w, _, _) = wallet();
+    let blocks = keyring_blocks(&w);
+    assert_eq!(dalek_hits(&Keyring::new(), &[], &blocks, 1, 100), [], "no accounts, no hits");
+    let one = copies(&w, 1);
+    assert_eq!(one.flag_by(&blocks, 1, usize::MAX, &mut OnDalek::new(&[w.view], 100)).unwrap(), None, "under min_keys");
+}
+
+/// The same on the GPU, after `the_gpu_flags_the_same_blocks`' warm-up.
+#[test]
+#[ignore = "needs a GPU; run with --ignored"]
+fn a_keyring_on_the_gpu_flags_what_dalek_does() {
+    warm_up();
+    assert!(settle(std::time::Duration::from_secs(120)) && engine::gpu_ready(), "the GPU started");
+    let on_gpu = |keyring: &Keyring, _: &[Scalar], blocks: &[ScannableBlock]| keyring.flag_many(blocks, 4, 0).expect("the GPU filtered");
+    copies_flag_what_one_flags(on_gpu);
+    each_account_has_its_own_hits(on_gpu);
+    // Two keyrings with an arena each, at once.
+    let (w, _, _) = wallet();
+    let blocks = keyring_blocks(&w);
+    let mut first = copies(&w, 3);
+    first.arena = Arena::new();
+    let mut second = copies(&w, 7);
+    second.arena = Arena::new();
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| first.flag_many(&blocks, 4, 0));
+        let b = scope.spawn(|| second.flag_many(&blocks, 4, 0));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_eq!(a.unwrap(), dalek_hits(&first, &[w.view; 3], &blocks, 4, 1000));
+    assert_eq!(b.unwrap(), dalek_hits(&second, &[w.view; 7], &blocks, 4, 1000));
+    assert!(engine::gpu_ready(), "and it hasn't been retired");
 }
 
 /// Whatever's in a transaction's extra, the keys read are `Extra::keys`' keys.

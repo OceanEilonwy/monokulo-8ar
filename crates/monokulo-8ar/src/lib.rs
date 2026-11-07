@@ -16,6 +16,12 @@
 //! every block with the `Scanner`. Which way is a matter of speed and power,
 //! never of the answer. [`engine`] says which is in use.
 //!
+//! A [`Keyring`] does the same for many accounts in one pass: every key with
+//! every account's view key, and [`Keyring::flag_many`] says which
+//! transactions may pay which account. [`Prefilter`] is a keyring of one. A
+//! keyring works in an [`Arena`], its own share of the one GPU, so keyrings in
+//! different arenas run side by side.
+//!
 //! Written for Fob, whose `docs/decisions.md` gives the reasons (decisions 331,
 //! 332, 350, 351, 359, 360), and shared with monokulo-lws.
 
@@ -23,12 +29,18 @@ mod engine;
 pub mod gpu;
 mod vectors;
 
-pub use engine::{Engine, Reason, check_wallet, engine, gpu_failed, gpu_identity, gpu_ready, rest, set_cache_dir, settle, warm_up};
+pub use engine::{Arena, Engine, Reason, check_wallet, engine, gpu_failed, gpu_identity, gpu_ready, rest, set_cache_dir, settle, warm_up};
 
 use std::{
     collections::HashSet,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    ops::Range,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+
+use gpu::GpuError;
 
 use curve25519_dalek::{EdwardsPoint, Scalar, constants::ED25519_BASEPOINT_TABLE};
 use monero_wallet::{
@@ -48,18 +60,20 @@ const NEWEST_FORK: u8 = 16;
 const CHUNK: usize = 64;
 
 /// Runs the check a GPU must pass before it's used: for the test tool.
-pub fn startup_vectors(gpu: &gpu::Gpu) -> Result<bool, gpu::GpuError> {
+pub fn startup_vectors(gpu: &gpu::Arena) -> Result<bool, gpu::GpuError> {
     vectors::passes(gpu)
 }
 
 /// Runs the check a wallet's own view key must pass: for the test tool.
-pub fn wallet_vectors(gpu: &gpu::Gpu, view: &Zeroizing<[u8; 32]>) -> Result<bool, gpu::GpuError> {
+pub fn wallet_vectors(gpu: &gpu::Arena, view: &Zeroizing<[u8; 32]>) -> Result<bool, gpu::GpuError> {
     vectors::passes_for_wallet(gpu, view)
 }
 
 /// A transaction key and the outputs to try with it.
 struct Job<'a> {
     block: usize,
+    /// 0 for the miner transaction, 1 on for the block's others.
+    tx: usize,
     key: [u8; 32],
     outputs: Outputs<'a>,
 }
@@ -143,14 +157,19 @@ fn varint(mut n: usize, out: &mut Vec<u8>) {
 
 /// Runs `each` over `items` on `threads` threads, a chunk at a time.
 fn in_chunks<T: Sync>(items: &[T], threads: usize, chunk: usize, each: impl Fn(usize, &[T]) + Sync) {
+    in_ranges(items.len(), threads, chunk, |range| each(range.start, &items[range]));
+}
+
+/// Runs `each` over `0..count` on `threads` threads, a chunk at a time.
+fn in_ranges(count: usize, threads: usize, chunk: usize, each: impl Fn(Range<usize>) + Sync) {
     let next = AtomicUsize::new(0);
     let work = || {
         loop {
             let at = next.fetch_add(chunk, Ordering::Relaxed);
-            if at >= items.len() {
+            if at >= count {
                 return;
             }
-            each(at, &items[at..(at + chunk).min(items.len())]);
+            each(at..(at + chunk).min(count));
         }
     };
     if threads <= 1 {
@@ -171,94 +190,41 @@ const IDENTITY: [u8; 32] = {
     bytes
 };
 
-/// What a wallet watches for: its view key and every spend key it could be paid at.
+/// An account in a [`Keyring`]: the order it was added in, from 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AccountId(u32);
+
+impl AccountId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A transaction that may pay an account: its block's place in the batch, and
+/// `tx` 0 for the miner transaction, 1 on for `block.transactions[tx - 1]`.
+/// [`Hit::WHOLE_BLOCK`] is a block the prefilter can't vouch for (a newer fork,
+/// transactions missing), for the `Scanner` to read whole for the account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Hit {
+    pub account: AccountId,
+    pub block: usize,
+    pub tx: usize,
+}
+
+impl Hit {
+    /// `tx` for a block to read whole.
+    pub const WHOLE_BLOCK: usize = usize::MAX;
+}
+
+/// What one account watches for: its view key and every spend key it could be paid at.
 #[derive(Clone)]
-pub struct Prefilter {
+struct Account {
     digits: gpu::Digits,
     spends: HashSet<[u8; 32]>,
 }
 
-impl Prefilter {
-    /// A filter for `pair`'s primary address. `view` is `pair`'s view key.
-    pub fn new(pair: &ViewPair, view: &Zeroizing<[u8; 32]>) -> Prefilter {
-        Prefilter { digits: gpu::Digits::new(view), spends: HashSet::from([pair.spend().compress().to_bytes()]) }
-    }
-
-    /// Watches a subaddress of `pair`, as `Scanner::register_subaddress` does.
-    pub fn watch(&mut self, pair: &ViewPair, subaddress: SubaddressIndex) {
-        // The spend key is the same on every network.
-        self.spends.insert(pair.subaddress(Network::Mainnet, subaddress).spend().compress().to_bytes());
-    }
-
-    /// Whether each of `blocks` could hold money for this wallet, or `None` if
-    /// it didn't filter them: the GPU isn't ready or was retired, or the blocks
-    /// hold fewer than `min_keys` transaction keys, where a GPU batch costs more
-    /// than it saves (its cost is the caller's to weigh). The caller then scans
-    /// every block with the `Scanner`. Asking starts the GPU if it hasn't been.
-    pub fn flag(&self, blocks: &[ScannableBlock], threads: usize, min_keys: usize) -> Option<Vec<bool>> {
-        if !engine::usable() {
-            return None;
-        }
-        self.flag_with(blocks, threads, min_keys, engine::batch(), |keys| engine::derive(&self.digits, keys))
-    }
-
-    /// [`flag`](Prefilter::flag), with `derive` working out 8aR for at most `most`
-    /// keys at a time: the GPU, or curve25519-dalek in the tests.
-    fn flag_with(&self, blocks: &[ScannableBlock], threads: usize, min_keys: usize, most: usize, derive: impl Fn(&[[u8; 32]]) -> Option<gpu::Points>) -> Option<Vec<bool>> {
-        let flags: Vec<AtomicBool> = blocks.iter().map(|_| AtomicBool::new(false)).collect();
-        let found: std::sync::Mutex<Vec<Vec<Job>>> = std::sync::Mutex::new(vec![]);
-        let numbered: Vec<(usize, &ScannableBlock)> = blocks.iter().enumerate().collect();
-        in_chunks(&numbered, threads, 16, |_, part| {
-            let mut jobs = Vec::with_capacity(part.len() * 64);
-            for (i, block) in part {
-                jobs_of(*i, block, &flags[*i], &mut jobs);
-            }
-            found.lock().expect("jobs lock").push(jobs);
-        });
-        let jobs: Vec<Job> = found.into_inner().expect("jobs lock").into_iter().flatten().collect();
-        if jobs.len() < min_keys || !self.with_gpu(&jobs, &flags, threads, most, derive) {
-            return None;
-        }
-        Some(flags.into_iter().map(AtomicBool::into_inner).collect())
-    }
-
-    /// The GPU works out every key's 8aR, a batch at a time, and the cores do
-    /// what follows. False if the GPU failed, which retires it.
-    fn with_gpu(&self, jobs: &[Job], flags: &[AtomicBool], threads: usize, most: usize, derive: impl Fn(&[[u8; 32]]) -> Option<gpu::Points>) -> bool {
-        std::thread::scope(|scope| {
-            // The GPU goes on to its next batch while the cores finish its last.
-            let (done, finishing) = std::sync::mpsc::sync_channel::<(&[Job], gpu::Points)>(1);
-            scope.spawn(move || {
-                for (part, points) in finishing {
-                    in_chunks(part, threads, CHUNK, |at, chunk| {
-                        // Off the curve is the identity, as Monero treats it.
-                        let derivations: Zeroizing<Vec<[u8; 32]>> = Zeroizing::new((at..at + chunk.len()).map(|i| points.get(i).unwrap_or(IDENTITY)).collect());
-                        self.finish(&derivations, chunk, flags);
-                    });
-                }
-            });
-            for part in jobs.chunks(most) {
-                let keys: Vec<[u8; 32]> = part.iter().map(|job| sendable(&job.key)).collect();
-                let Some(points) = derive(&keys) else { return false };
-                if let Err(unsent) = done.send((part, points)) {
-                    // The finishing thread has gone only by panicking, which the scope passes on.
-                    drop(unsent);
-                    return false;
-                }
-            }
-            true
-        })
-    }
-
-    fn finish(&self, derivations: &[[u8; 32]], jobs: &[Job], flags: &[AtomicBool]) {
-        for (derivation, job) in derivations.iter().zip(jobs) {
-            if !flags[job.block].load(Ordering::Relaxed) && self.pays_us(derivation, &job.outputs) {
-                flags[job.block].store(true, Ordering::Relaxed);
-            }
-        }
-    }
-
-    fn pays_us(&self, derivation: &[u8; 32], outputs: &Outputs) -> bool {
+impl Account {
+    fn pays(&self, derivation: &[u8; 32], outputs: &Outputs) -> bool {
         let (prefix, range) = match outputs {
             Outputs::All(prefix) => (*prefix, 0..prefix.outputs.len()),
             Outputs::One(prefix, o) => (*prefix, *o..*o + 1),
@@ -293,36 +259,251 @@ impl Prefilter {
     }
 }
 
-/// Adds the work `block` needs to `jobs`, or flags it if it's beyond checking.
-fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, flag: &AtomicBool, jobs: &mut Vec<Job<'a>>) {
+/// What works out 8aR for a grid of accounts by keys: an arena of the GPU, or
+/// curve25519-dalek in the tests.
+trait Deriver {
+    /// The most items a slab takes.
+    fn batch(&self) -> usize;
+    fn load(&mut self, accounts: &[&gpu::Digits], keys: &[[u8; 32]]) -> Result<(), GpuError>;
+    fn slab(&mut self, first_item: u64, count: usize) -> Result<gpu::Points, GpuError>;
+    fn unload(&mut self);
+}
+
+struct OnGpu<'a>(&'a gpu::Arena);
+
+impl Deriver for OnGpu<'_> {
+    fn batch(&self) -> usize {
+        self.0.tuning().batch
+    }
+
+    fn load(&mut self, accounts: &[&gpu::Digits], keys: &[[u8; 32]]) -> Result<(), GpuError> {
+        self.0.load(accounts, keys)
+    }
+
+    fn slab(&mut self, first_item: u64, count: usize) -> Result<gpu::Points, GpuError> {
+        self.0.slab(first_item, count)
+    }
+
+    fn unload(&mut self) {
+        self.0.unload();
+    }
+}
+
+/// The most items one load takes: the shader counts them in 32 bits.
+const MOST_ITEMS: u64 = (1 << 31) - 1;
+
+/// Many accounts' view keys, and every spend key each could be paid at: one GPU
+/// pass works out 8aR for every transaction key with every account's view key.
+/// The accounts by keys grid is never written out; the GPU takes a slab of it
+/// at a time, and memory doesn't grow with accounts beyond 64 bytes each.
+#[derive(Clone)]
+pub struct Keyring {
+    accounts: Vec<Account>,
+    arena: Arena,
+}
+
+impl Default for Keyring {
+    fn default() -> Keyring {
+        Keyring::new()
+    }
+}
+
+impl Keyring {
+    /// An empty keyring on the shared arena, as a phone wants.
+    pub fn new() -> Keyring {
+        Keyring::with_arena(Arena::shared())
+    }
+
+    /// An empty keyring that works in `arena`, beside keyrings in other arenas.
+    pub fn with_arena(arena: Arena) -> Keyring {
+        Keyring { accounts: vec![], arena }
+    }
+
+    pub fn arena(&self) -> &Arena {
+        &self.arena
+    }
+
+    /// Adds `pair`'s primary address. `view` is `pair`'s view key.
+    pub fn add(&mut self, pair: &ViewPair, view: &Zeroizing<[u8; 32]>) -> AccountId {
+        let id = AccountId(u32::try_from(self.accounts.len()).expect("fewer than 2^32 accounts"));
+        self.accounts.push(Account { digits: gpu::Digits::new(view), spends: HashSet::from([pair.spend().compress().to_bytes()]) });
+        id
+    }
+
+    /// Watches a subaddress of `pair`, `account`'s, as `Scanner::register_subaddress` does.
+    pub fn watch(&mut self, account: AccountId, pair: &ViewPair, subaddress: SubaddressIndex) {
+        // The spend key is the same on every network.
+        self.accounts[account.index()].spends.insert(pair.subaddress(Network::Mainnet, subaddress).spend().compress().to_bytes());
+    }
+
+    pub fn len(&self) -> usize {
+        self.accounts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+    }
+
+    /// The transactions in `blocks` that may pay each account, or `None` if it
+    /// didn't filter them: the GPU isn't ready or was retired (or failed now,
+    /// which retires it), or the blocks hold fewer than `min_keys` transaction
+    /// keys, where a GPU batch costs more than it saves (its cost is the
+    /// caller's to weigh). The caller then scans every block for every account
+    /// with the `Scanner`. Asking starts the GPU if it hasn't been. Hits come
+    /// sorted, by account, block and transaction.
+    pub fn flag_many(&self, blocks: &[ScannableBlock], threads: usize, min_keys: usize) -> Option<Vec<Hit>> {
+        if !engine::usable() {
+            return None;
+        }
+        self.arena.with(|gpu| self.flag_by(blocks, threads, min_keys, &mut OnGpu(gpu))).flatten()
+    }
+
+    /// [`flag_many`](Keyring::flag_many), with `deriver` doing the GPU's part.
+    fn flag_by(&self, blocks: &[ScannableBlock], threads: usize, min_keys: usize, deriver: &mut impl Deriver) -> Result<Option<Vec<Hit>>, GpuError> {
+        let found: Mutex<(Vec<Job>, Vec<usize>)> = Mutex::new((vec![], vec![]));
+        let numbered: Vec<(usize, &ScannableBlock)> = blocks.iter().enumerate().collect();
+        in_chunks(&numbered, threads, 16, |_, part| {
+            let mut jobs = Vec::with_capacity(part.len() * 64);
+            let mut whole = vec![];
+            for (i, block) in part {
+                if !jobs_of(*i, block, &mut jobs) {
+                    whole.push(*i);
+                }
+            }
+            let mut found = found.lock().expect("jobs lock");
+            found.0.extend(jobs);
+            found.1.extend(whole);
+        });
+        let (jobs, whole) = found.into_inner().expect("jobs lock");
+        if jobs.len() < min_keys {
+            return Ok(None);
+        }
+        let accounts = self.accounts.len();
+        let mut hits: Vec<Hit> = whole.iter().flat_map(|&block| (0..accounts).map(move |a| Hit { account: AccountId(a as u32), block, tx: Hit::WHOLE_BLOCK })).collect();
+        if accounts > 0 && !jobs.is_empty() {
+            let digits: Vec<&gpu::Digits> = self.accounts.iter().map(|a| &a.digits).collect();
+            let per_load = (MOST_ITEMS / accounts as u64).max(1) as usize;
+            for part in jobs.chunks(per_load) {
+                hits.extend(self.on_grid(part, &digits, threads, deriver)?);
+            }
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        Ok(Some(hits))
+    }
+
+    /// Every account with every one of `jobs`' keys: the deriver works out a slab
+    /// while the cores finish the last.
+    fn on_grid(&self, jobs: &[Job], digits: &[&gpu::Digits], threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
+        let keys: Vec<[u8; 32]> = jobs.iter().map(|job| sendable(&job.key)).collect();
+        deriver.load(digits, &keys)?;
+        let items = (jobs.len() * digits.len()) as u64;
+        let batch = deriver.batch() as u64;
+        let found = Mutex::new(vec![]);
+        let result = std::thread::scope(|scope| {
+            // The GPU goes on to its next slab while the cores finish its last.
+            let (done, finishing) = std::sync::mpsc::sync_channel::<(u64, gpu::Points)>(1);
+            let found = &found;
+            scope.spawn(move || {
+                for (first, points) in finishing {
+                    in_ranges(points.len(), threads, CHUNK, |range| {
+                        let mut hits = vec![];
+                        for i in range {
+                            let item = first + i as u64;
+                            let (account, job) = ((item / jobs.len() as u64) as usize, &jobs[(item % jobs.len() as u64) as usize]);
+                            // Off the curve is the identity, as Monero treats it.
+                            let derivation = Zeroizing::new(points.get(i).unwrap_or(IDENTITY));
+                            if self.accounts[account].pays(&derivation, &job.outputs) {
+                                hits.push(Hit { account: AccountId(account as u32), block: job.block, tx: job.tx });
+                            }
+                        }
+                        if !hits.is_empty() {
+                            found.lock().expect("hits lock").extend(hits);
+                        }
+                    });
+                }
+            });
+            let mut first = 0;
+            while first < items {
+                let points = deriver.slab(first, batch.min(items - first) as usize)?;
+                if done.send((first, points)).is_err() {
+                    // The finishing thread has gone only by panicking, which the scope passes on.
+                    break;
+                }
+                first += batch;
+            }
+            Ok(())
+        });
+        deriver.unload();
+        result.map(|()| found.into_inner().expect("hits lock"))
+    }
+}
+
+/// What a wallet watches for: a keyring of one account, its view key and every
+/// spend key it could be paid at.
+#[derive(Clone)]
+pub struct Prefilter(Keyring);
+
+impl Prefilter {
+    /// A filter for `pair`'s primary address. `view` is `pair`'s view key.
+    pub fn new(pair: &ViewPair, view: &Zeroizing<[u8; 32]>) -> Prefilter {
+        let mut keyring = Keyring::new();
+        keyring.add(pair, view);
+        Prefilter(keyring)
+    }
+
+    /// Watches a subaddress of `pair`, as `Scanner::register_subaddress` does.
+    pub fn watch(&mut self, pair: &ViewPair, subaddress: SubaddressIndex) {
+        self.0.watch(AccountId(0), pair, subaddress);
+    }
+
+    /// Whether each of `blocks` could hold money for this wallet, or `None` if
+    /// it didn't filter them, as [`Keyring::flag_many`] says.
+    pub fn flag(&self, blocks: &[ScannableBlock], threads: usize, min_keys: usize) -> Option<Vec<bool>> {
+        self.0.flag_many(blocks, threads, min_keys).map(|hits| flags(&hits, blocks.len()))
+    }
+}
+
+/// One bool a block: whether any hit is in it.
+fn flags(hits: &[Hit], blocks: usize) -> Vec<bool> {
+    let mut flags = vec![false; blocks];
+    for hit in hits {
+        flags[hit.block] = true;
+    }
+    flags
+}
+
+/// Adds the work `block` needs to `jobs`. False if it's beyond checking, for the
+/// `Scanner` to read whole.
+fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>) -> bool {
     if block.block.transactions.len() != block.transactions.len() || block.block.header.hardfork_version > NEWEST_FORK {
-        flag.store(true, Ordering::Relaxed);
-        return;
+        return false;
     }
     if block.output_index_for_first_ringct_output.is_none() {
-        return;
+        return true;
     }
     let miner = block.block.miner_transaction();
-    let mut add = |version: u64, prefix: &'a TransactionPrefix| {
+    let mut add = |tx: usize, version: u64, prefix: &'a TransactionPrefix| {
         if version != 2 {
             return;
         }
         let Ok(extra) = Extra::read(&mut prefix.extra.as_slice()) else { return };
         let Some((keys, additional)) = encoded_keys(&extra) else { return };
         for key in keys {
-            jobs.push(Job { block: index, key, outputs: Outputs::All(prefix) });
+            jobs.push(Job { block: index, tx, key, outputs: Outputs::All(prefix) });
         }
         for (o, key) in additional.into_iter().flatten().enumerate() {
             if o < prefix.outputs.len() {
-                jobs.push(Job { block: index, key, outputs: Outputs::One(prefix, o) });
+                jobs.push(Job { block: index, tx, key, outputs: Outputs::One(prefix, o) });
             }
         }
     };
     let version = |tx_is_v2: bool| if tx_is_v2 { 2 } else { 1 };
-    add(version(matches!(miner, Transaction::V2 { .. })), miner.prefix());
-    for tx in &block.transactions {
-        add(version(matches!(tx, Transaction::V2 { .. })), tx.prefix());
+    add(0, version(matches!(miner, Transaction::V2 { .. })), miner.prefix());
+    for (i, tx) in block.transactions.iter().enumerate() {
+        add(i + 1, version(matches!(tx, Transaction::V2 { .. })), tx.prefix());
     }
+    true
 }
 
 #[cfg(test)]

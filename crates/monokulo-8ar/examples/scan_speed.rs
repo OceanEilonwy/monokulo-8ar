@@ -1,6 +1,10 @@
 //! Times the engines on a fixture written by prototypes/scan-bench:
 //!
-//!   scan_speed <file> [--threads N] [--batch N] [--windows N] [--every N] [--group N] [--runs N] [--any]
+//!   scan_speed <file> [--keys N] [--threads N] [--batch N] [--windows N] [--every N] [--group N] [--runs N] [--any]
+//!
+//! `--keys N` runs the fixture through a keyring of N copies of the view key, as
+//! a server with N accounts would: one load of the keys and N accounts' digits,
+//! the grid taken a batch at a time, and every copy's digest checked.
 //!
 //! Each run does the arithmetic, the compression and every view tag, and prints
 //! the XOR of all derivations: e0c4c620... for the 2000-block fixture.
@@ -17,7 +21,7 @@
 
 use std::{io::Read, sync::atomic::{AtomicUsize, Ordering}, time::Instant};
 
-use monokulo_8ar::gpu::{Digits, Gpu, TUNING, Tuning};
+use monokulo_8ar::gpu::{Arena, Device, Digits, TUNING, Tuning};
 use curve25519_dalek::Scalar;
 use sha3::{Digest, Keccak256};
 
@@ -115,9 +119,9 @@ fn arg(args: &[String], name: &str, default: usize) -> usize {
     args.iter().position(|a| a == name).map_or(default, |i| args[i + 1].parse().expect("a number"))
 }
 
-fn gpu_batch(jobs: &[Job], digits: &Digits, threads: usize, gpu: &Gpu) {
+fn gpu_batch(jobs: &[Job], digits: &Digits, threads: usize, gpu: &Arena) {
     let keys: Vec<[u8; 32]> = jobs.iter().map(|j| j.r).collect();
-    let points = gpu.derive(digits, &keys).expect("the GPU ran");
+    let points = gpu.derive(&[digits], &keys).expect("the GPU ran");
     in_parallel(jobs.len(), threads, 64, |at, end| {
         let points: Vec<_> = (at..end).map(|i| points.get(i).expect("on the curve")).collect();
         finish(&points, &jobs[at..end])
@@ -132,7 +136,8 @@ fn tip(args: &[String], blocks: u64, jobs: &[Job], digits: &Digits, sizes: &str)
     let seconds = arg(args, "--seconds", 40) as u64;
     let rounds = arg(args, "--rounds", 4);
     let period = std::time::Duration::from_millis(arg(args, "--period-ms", 2300) as u64);
-    let gpu = Gpu::start(args.iter().position(|a| a == "--cache").map(|i| args[i + 1].clone().into()), TUNING, false).expect("a GPU");
+    let device = Device::start(args.iter().position(|a| a == "--cache").map(|i| args[i + 1].clone().into()), TUNING, false).expect("a GPU");
+    let gpu = Arena::new(&device).expect("an arena");
     let per_block = jobs.len() as f64 / blocks as f64;
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()).saturating_sub(1).clamp(1, 8);
     println!("{}, {per_block:.0} keys a block, one batch each {period:?}", gpu.name());
@@ -214,11 +219,7 @@ fn main() {
     let runs = arg(&args, "--runs", 1);
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()).saturating_sub(1).clamp(1, 8);
     let threads = arg(&args, "--threads", cores);
-    let show = |run: usize, seconds: f64, gpu: f64, (digest, hits): ([u8; 32], u64)| {
-        let hex: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
-        println!("run {run}: {seconds:.3} s, {:.0} blocks/s, {:.0} keys/s, GPU part {gpu:.3} s, digest {hex}, tags {hits}", blocks as f64 / seconds, jobs.len() as f64 / seconds);
-        assert_eq!(hex, "e0c4c620", "the wrong answer");
-    };
+    let copies = arg(&args, "--keys", 1);
     let tuning = Tuning {
         batch: arg(&args, "--batch", TUNING.batch),
         windows: arg(&args, "--windows", TUNING.windows),
@@ -226,37 +227,61 @@ fn main() {
         group: arg(&args, "--group", TUNING.group as usize) as u32,
     };
     let started = Instant::now();
-    let gpu = Gpu::start(args.iter().position(|a| a == "--cache").map(|i| args[i + 1].clone().into()), tuning, args.iter().any(|a| a == "--any")).expect("a GPU");
-    println!("{}, {tuning:?}, started in {:.1} s", gpu.name(), started.elapsed().as_secs_f64());
+    let device = Device::start(args.iter().position(|a| a == "--cache").map(|i| args[i + 1].clone().into()), tuning, args.iter().any(|a| a == "--any")).expect("a GPU");
+    let gpu = Arena::new(&device).expect("an arena");
+    println!("{}, {tuning:?}, {} queue(s), {copies} key(s), started in {:.1} s", device.name(), device.queues(), started.elapsed().as_secs_f64());
+    let keys: Vec<[u8; 32]> = jobs.iter().map(|j| j.r).collect();
+    let accounts: Vec<&Digits> = vec![&digits; copies];
+    let items = (jobs.len() * copies) as u64;
     for run in 1..=runs {
         let started = Instant::now();
         let mut gpu_seconds = 0.0;
-        let mut all = ([0u8; 32], 0);
-        // As the wallet does: the GPU goes on while the cores finish the last batch.
+        // Each copy's digest and tags, all of which must be the one key's.
+        let mut each = vec![([0u8; 32], 0u64); copies];
+        // As a keyring does: the GPU goes on while the cores finish the last batch.
         std::thread::scope(|scope| {
-            let (done, finishing) = std::sync::mpsc::sync_channel::<(&[Job], monokulo_8ar::gpu::Points)>(1);
+            let (done, finishing) = std::sync::mpsc::sync_channel::<(u64, monokulo_8ar::gpu::Points)>(1);
+            let (jobs, each) = (&jobs, &mut each);
             let finisher = scope.spawn(move || {
-                let mut all = ([0u8; 32], 0);
-                for (part, points) in finishing {
-                    let result = in_parallel(part.len(), threads, 64, |at, end| {
-                        let points: Vec<_> = (at..end).map(|i| points.get(i).expect("on the curve")).collect();
-                        finish(&points, &part[at..end])
-                    });
-                    all.0.iter_mut().zip(result.0).for_each(|(a, d)| *a ^= d);
-                    all.1 += result.1;
+                for (first, points) in finishing {
+                    // The slab a piece at a time, each piece within one account's row.
+                    let mut at = 0;
+                    while at < points.len() {
+                        let item = first + at as u64;
+                        let (account, key) = ((item / jobs.len() as u64) as usize, (item % jobs.len() as u64) as usize);
+                        let end = (at + jobs.len() - key).min(points.len());
+                        let result = in_parallel(end - at, threads, 64, |from, to| {
+                            let derivations: Vec<_> = (at + from..at + to).map(|i| points.get(i).expect("on the curve")).collect();
+                            finish(&derivations, &jobs[key + from..key + to])
+                        });
+                        each[account].0.iter_mut().zip(result.0).for_each(|(a, d)| *a ^= d);
+                        each[account].1 += result.1;
+                        at = end;
+                    }
                 }
-                all
             });
-            for part in jobs.chunks(tuning.batch) {
-                let keys: Vec<[u8; 32]> = part.iter().map(|j| j.r).collect();
+            gpu.load(&accounts, &keys).expect("the GPU took the keys");
+            let mut first = 0;
+            while first < items {
                 let t = Instant::now();
-                let points = gpu.derive(&digits, &keys).expect("the GPU ran");
+                let points = gpu.slab(first, (tuning.batch as u64).min(items - first) as usize).expect("the GPU ran");
                 gpu_seconds += t.elapsed().as_secs_f64();
-                done.send((part, points)).unwrap();
+                done.send((first, points)).unwrap();
+                first += tuning.batch as u64;
             }
+            gpu.unload();
             drop(done);
-            all = finisher.join().unwrap();
+            finisher.join().unwrap();
         });
-        show(run, started.elapsed().as_secs_f64(), gpu_seconds, all);
+        let seconds = started.elapsed().as_secs_f64();
+        let hex: String = each[0].0[..4].iter().map(|b| format!("{b:02x}")).collect();
+        println!(
+            "run {run}: {seconds:.3} s, {:.0} blocks/s, {:.0} keys/s, {:.0} account-blocks/s, GPU part {gpu_seconds:.3} s, digest {hex}, tags {}",
+            blocks as f64 / seconds,
+            items as f64 / seconds,
+            (blocks * copies as u64) as f64 / seconds,
+            each[0].1
+        );
+        assert!(each.iter().all(|(digest, tags)| digest[..4] == [0xe0, 0xc4, 0xc6, 0x20] && *tags == 906), "the wrong answer");
     }
 }

@@ -1,9 +1,9 @@
-//! The one GPU a process has, and what state it's in.
+//! The one GPU a process has, what state it's in, and the arenas that use it.
 
 use std::{
     path::PathBuf,
     sync::{
-        Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicU8, Ordering},
     },
     thread::JoinHandle,
@@ -13,7 +13,7 @@ use std::{
 use zeroize::Zeroizing;
 
 use crate::{
-    gpu::{Digits, Gpu, GpuErrorKind, Points, TUNING},
+    gpu::{self, Device, GpuError, GpuErrorKind},
     vectors,
 };
 
@@ -55,7 +55,11 @@ const FAILED: u8 = 6;
 /// `FAILED`: a GPU that's failed isn't tried again until the process restarts.
 static STATE: AtomicU8 = AtomicU8::new(NOT_STARTED);
 static CACHE_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-static GPU: OnceLock<Mutex<Option<Gpu>>> = OnceLock::new();
+/// The device, once it's passed its vectors, until it's retired. Arenas hold it
+/// too, so it goes once the last of them lets go.
+static DEVICE: Mutex<Option<Arc<Device>>> = Mutex::new(None);
+/// The arena `Prefilter`, `check_wallet` and a `Keyring` made with `new` use.
+static DEFAULT: OnceLock<Arena> = OnceLock::new();
 /// The ready GPU's name, readable without waiting for a batch to finish.
 static NAME: OnceLock<String> = OnceLock::new();
 /// The warm-up thread, to join once it's done.
@@ -81,11 +85,12 @@ pub fn warm_up() {
     }
     let dir = CACHE_DIR.lock().expect("cache lock").clone();
     let started = std::thread::Builder::new().name("monokulo-8ar-gpu".into()).spawn(move || {
-        let state = match Gpu::start_for_device(dir, false) {
-            Ok(gpu) => match vectors::passes(&gpu) {
+        let state = match Device::start_for_device(dir, false) {
+            // The vectors run in an arena of their own, freed after.
+            Ok(device) => match gpu::Arena::new(&device).and_then(|arena| vectors::passes(&arena)) {
                 Ok(true) => {
-                    let _ = NAME.set(gpu.name().to_owned());
-                    let _ = GPU.set(Mutex::new(Some(gpu)));
+                    let _ = NAME.set(device.name().to_owned());
+                    *DEVICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(device);
                     READY
                 }
                 Ok(false) => FAILED_SELF_TEST,
@@ -176,42 +181,107 @@ pub fn gpu_failed() -> bool {
 
 /// Whether the GPU has started, passed its vectors and hasn't failed.
 pub fn gpu_ready() -> bool {
-    STATE.load(Ordering::Relaxed) == READY && GPU.get().is_some()
+    STATE.load(Ordering::Relaxed) == READY && device().is_some()
+}
+
+fn device() -> Option<Arc<Device>> {
+    DEVICE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The GPU and driver that's ready to scan, if one is.
 pub fn gpu_identity() -> Option<String> {
-    if !gpu_ready() {
+    if STATE.load(Ordering::Relaxed) != READY {
         return None;
     }
-    GPU.get()?.lock().ok()?.as_ref().map(Gpu::identity)
+    device().map(|d| d.identity())
 }
 
-/// Retires the GPU after a failure, until the process restarts.
-fn retire(gpu: &mut Option<Gpu>) {
-    *gpu = None;
+/// Retires the GPU after a failure, until the process restarts. Arenas let go
+/// of it as they next look.
+fn retire() {
     STATE.store(FAILED, Ordering::Relaxed);
+    DEVICE.lock().unwrap_or_else(|e| e.into_inner()).take();
+}
+
+/// A share of the GPU for one caller: its own buffers, command buffer and
+/// fence, about 43 MB once it's been used. Several arenas work at once, so two
+/// keyrings with an arena each (a server's lanes, say) don't wait on each
+/// other's batches. A clone is the same arena: whoever holds it has it for a
+/// whole `flag_many` at a time. Nothing is made until the GPU is ready and a
+/// batch needs it.
+#[derive(Clone, Default)]
+pub struct Arena(Arc<Mutex<Option<gpu::Arena>>>);
+
+impl Arena {
+    pub fn new() -> Arena {
+        Arena::default()
+    }
+
+    /// The arena most callers share: one, as a phone needs.
+    pub fn shared() -> Arena {
+        DEFAULT.get_or_init(Arena::new).clone()
+    }
+
+    /// Runs `work` in this arena, making it if need be. `None` if the GPU isn't
+    /// ready, or `work` failed, which retires the GPU.
+    pub(crate) fn with<T>(&self, work: impl FnOnce(&gpu::Arena) -> Result<T, GpuError>) -> Option<T> {
+        let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let device = match STATE.load(Ordering::Relaxed) {
+            READY => device(),
+            _ => None,
+        };
+        let Some(device) = device else {
+            // A retired device goes once its arenas let go.
+            held.take();
+            return None;
+        };
+        if held.as_ref().is_none_or(|arena| !Arc::ptr_eq(arena.device(), &device)) {
+            match gpu::Arena::new(&device) {
+                Ok(arena) => *held = Some(arena),
+                Err(_) => {
+                    retire();
+                    return None;
+                }
+            }
+        }
+        match work(held.as_ref().expect("just made")) {
+            Ok(done) => Some(done),
+            Err(_) => {
+                held.take();
+                retire();
+                None
+            }
+        }
+    }
+
+    /// Gives back the memory the arena kept between batches. One in use is left
+    /// alone, as whoever's using it still wants that memory.
+    pub fn release(&self) {
+        if let Ok(held) = self.0.try_lock()
+            && let Some(arena) = held.as_ref()
+        {
+            arena.release();
+        }
+    }
+}
+
+impl std::fmt::Debug for Arena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Arena")
+    }
 }
 
 /// Has the ready GPU work with a wallet's own view key, for that wallet to keep
 /// the result. `None` if there's no GPU to ask, or it failed, which retires it.
 pub fn check_wallet(view: &Zeroizing<[u8; 32]>) -> Option<bool> {
-    let slot = GPU.get()?;
-    let mut gpu = slot.lock().ok()?;
-    match vectors::passes_for_wallet(gpu.as_ref()?, view) {
-        Ok(passed) => Some(passed),
-        Err(_) => {
-            retire(&mut gpu);
-            None
-        }
-    }
+    Arena::shared().with(|arena| vectors::passes_for_wallet(arena, view))
 }
 
 /// Whether the GPU can take a batch now. One that hasn't been started is started,
 /// for the batches after this one.
 pub(crate) fn usable() -> bool {
     match STATE.load(Ordering::Relaxed) {
-        READY => GPU.get().is_some(),
+        READY => device().is_some(),
         NOT_STARTED => {
             warm_up();
             false
@@ -220,32 +290,10 @@ pub(crate) fn usable() -> bool {
     }
 }
 
-/// The most keys to give [`derive`] at once.
-pub(crate) fn batch() -> usize {
-    TUNING.batch
-}
-
-/// Scanning has caught up: gives back the memory the GPU kept between batches. A
-/// GPU in use is left alone, as whoever's using it still wants that memory.
+/// Scanning has caught up: gives back the memory the shared arena kept between
+/// batches. Other arenas are released by whoever holds them.
 pub fn rest() {
-    if let Some(Ok(gpu)) = GPU.get().map(Mutex::try_lock)
-        && let Some(gpu) = gpu.as_ref()
-    {
-        gpu.release();
-    }
-}
-
-/// 8aR on the GPU, or `None` once it's failed, which retires it.
-pub(crate) fn derive(digits: &Digits, keys: &[[u8; 32]]) -> Option<Points> {
-    let slot = GPU.get()?;
-    let mut gpu = slot.lock().ok()?;
-    match gpu.as_ref()?.derive(digits, keys) {
-        Ok(points) => Some(points),
-        Err(_) => {
-            retire(&mut gpu);
-            None
-        }
-    }
+    Arena::shared().release();
 }
 
 #[cfg(test)]

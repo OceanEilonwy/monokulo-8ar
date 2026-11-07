@@ -9,7 +9,7 @@ use crypto_bigint::{Encoding, U256, U512};
 use curve25519_dalek::{Scalar, constants::{ED25519_BASEPOINT_TABLE, EIGHT_TORSION}, edwards::CompressedEdwardsY};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::gpu::{Digits, Gpu, GpuError, Points};
+use crate::gpu::{Arena, Digits, GpuError, Points};
 
 const P: [u32; 8] = [0xffff_ffed, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0x7fff_ffff];
 
@@ -69,6 +69,10 @@ fn field_answer(op: i32, a: &[u32; 8], b: &[u32; 8]) -> [u32; 8] {
     std::array::from_fn(|i| u32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]))
 }
 
+/// How many view keys the cases have, each with keys of its own and then all
+/// together over the first case's keys.
+const VIEWS: usize = 7;
+
 pub(crate) struct Case {
     view: Scalar,
     keys: Vec<[u8; 32]>,
@@ -90,6 +94,7 @@ pub(crate) fn cases(group: usize) -> Vec<Case> {
     // Each dispatch costs tens of milliseconds on a phone, however few keys: every
     // view key gets one good size, and the sizes around a workgroup one view key.
     let sizes = [1, group - 1, group, group + 1];
+    debug_assert_eq!(views.len(), VIEWS);
     let runs = views.iter().map(|view| (*view, 2 * group + 1)).chain(sizes.map(|size| (views[6], size)));
     let mut seed = first_seed();
     runs.map(|(view, size)| Case { view, keys: keys(&mut seed, size) }).collect()
@@ -137,31 +142,53 @@ pub(crate) fn agrees(case: &Case, points: &Points) -> bool {
     })
 }
 
+/// Whether `points` are the answers for every key in `keys` with every view key in
+/// `views`, account by account, as one load of an arena gives them.
+pub(crate) fn agrees_grid(views: &[Scalar], keys: &[[u8; 32]], points: &Points) -> bool {
+    if points.len() != views.len() * keys.len() {
+        return false;
+    }
+    (0..points.len()).all(|g| {
+        let (view, key) = (views[g / keys.len()], keys[g % keys.len()]);
+        match (CompressedEdwardsY(key).decompress(), points.get(g)) {
+            (Some(point), Some(got)) => Zeroizing::new(got) == Zeroizing::new((view * point).mul_by_cofactor().compress().to_bytes()),
+            (None, None) => true,
+            _ => false,
+        }
+    })
+}
+
 /// Runs the vectors on `gpu`: `Ok(false)` for a wrong answer.
-pub(crate) fn passes(gpu: &Gpu) -> Result<bool, GpuError> {
+pub(crate) fn passes(gpu: &Arena) -> Result<bool, GpuError> {
     let values = field_values();
     let pairs: Vec<([u32; 8], [u32; 8])> = values.iter().flat_map(|a| values.iter().map(move |b| (*a, *b))).collect();
     for op in 0..6 {
-        let got = gpu.check_field(op, &pairs)?;
+        let got = gpu.check_field(op as u32, &pairs)?;
         if pairs.iter().zip(&got).any(|((a, b), got)| field_answer(op, a, b) != *got) {
             return Ok(false);
         }
     }
-    for case in cases(gpu.tuning().group as usize) {
+    let cases = cases(gpu.tuning().group as usize);
+    for case in &cases {
         let digits = Digits::new(&case.view.to_bytes());
-        if !agrees(&case, &gpu.derive(&digits, &case.keys)?) {
+        if !agrees(case, &gpu.derive(&[&digits], &case.keys)?) {
             return Ok(false);
         }
     }
-    Ok(true)
+    // Every view key at once over the same keys: each item takes its own
+    // account's digits.
+    let views: Vec<Scalar> = cases.iter().map(|c| c.view).take(VIEWS).collect();
+    let digits: Vec<Digits> = views.iter().map(|v| Digits::new(&v.to_bytes())).collect();
+    let keys = &cases[0].keys;
+    Ok(agrees_grid(&views, keys, &gpu.derive(&digits.iter().collect::<Vec<_>>(), keys)?))
 }
 
 /// Runs a wallet's own view key on `gpu`, the same way scanning will: `Ok(false)`
 /// for a wrong answer.
-pub(crate) fn passes_for_wallet(gpu: &Gpu, view: &Zeroizing<[u8; 32]>) -> Result<bool, GpuError> {
+pub(crate) fn passes_for_wallet(gpu: &Arena, view: &Zeroizing<[u8; 32]>) -> Result<bool, GpuError> {
     let mut case = wallet_case(view, gpu.tuning().group as usize);
     let digits = Digits::new(view);
-    let result = gpu.derive(&digits, &case.keys).map(|points| agrees(&case, &points));
+    let result = gpu.derive(&[&digits], &case.keys).map(|points| agrees(&case, &points));
     case.view.zeroize();
     result
 }
@@ -213,18 +240,37 @@ mod tests {
     #[test]
     #[ignore = "needs a GPU; run with --ignored"]
     fn batches_in_turn_get_their_own_answers() {
-        let gpu = Gpu::start_for_device(None, false).expect("a GPU");
+        let device = crate::gpu::Device::start_for_device(None, false).expect("a GPU");
+        let gpu = Arena::new(&device).expect("an arena");
         let (batch, group) = (gpu.tuning().batch, gpu.tuning().group as usize);
         let view = Scalar::from_bytes_mod_order([0x5a; 32]);
         let digits = Digits::new(&view.to_bytes());
         let mut seed = first_seed();
         for size in [batch, 1, 3 * group + 1, batch - 1, group - 1, 2, batch / 2 + 1] {
             let case = Case { view, keys: keys(&mut seed, size) };
-            assert!(agrees(&case, &gpu.derive(&digits, &case.keys).expect("the GPU ran")), "{size} keys");
+            assert!(agrees(&case, &gpu.derive(&[&digits], &case.keys).expect("the GPU ran")), "{size} keys");
         }
         gpu.release();
         let case = Case { view, keys: keys(&mut seed, 2 * group + 1) };
-        assert!(agrees(&case, &gpu.derive(&digits, &case.keys).expect("the GPU ran")), "after resting");
+        assert!(agrees(&case, &gpu.derive(&[&digits], &case.keys).expect("the GPU ran")), "after resting");
+        // Three accounts over more keys than half a batch: slabs that start and
+        // end inside an account's row of the grid.
+        let views = [view, Scalar::from_bytes_mod_order([0x77; 32]), Scalar::ONE];
+        let all: Vec<Digits> = views.iter().map(|v| Digits::new(&v.to_bytes())).collect();
+        let grid_keys = keys(&mut seed, batch / 2 + 7);
+        let points = gpu.derive(&all.iter().collect::<Vec<_>>(), &grid_keys).expect("the GPU ran");
+        assert!(agrees_grid(&views, &grid_keys, &points), "a grid of three accounts");
+        // Two arenas on one device, one after the other and side by side.
+        let other = Arena::new(&device).expect("a second arena");
+        let (grid_ref, views_ref) = (&grid_keys, &views);
+        std::thread::scope(|scope| {
+            let theirs = scope.spawn(move || {
+                let other_digits = Digits::new(&views_ref[1].to_bytes());
+                agrees_grid(&views_ref[1..2], grid_ref, &other.derive(&[&other_digits], grid_ref).expect("the GPU ran"))
+            });
+            assert!(agrees_grid(&views, &grid_keys, &gpu.derive(&all.iter().collect::<Vec<_>>(), &grid_keys).expect("the GPU ran")));
+            assert!(theirs.join().unwrap(), "the other arena's answers");
+        });
     }
 
     #[test]

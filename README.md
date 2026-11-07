@@ -34,6 +34,26 @@ speed and power, never of the answer.
   process has, and `engine()` says what's doing the work (the GPU and its
   name, or the CPU and why), for a setting to show. The compiled pipeline is
   cached as `scan-gpu.cache` in the folder given to `set_cache_dir`.
+- `Keyring`: many accounts in one GPU pass, for a server. `Keyring::add(pair,
+  view) -> AccountId`, `watch(account, pair, subaddress)`, and
+  `flag_many(blocks, threads, min_keys) -> Option<Vec<Hit>>`, each `Hit` an
+  account, a block and a transaction in it (0 the miner transaction, 1 on the
+  block's others, `Hit::WHOLE_BLOCK` a block the account must have read
+  whole). `None` means what it does for `flag`. `Prefilter` is a keyring of
+  one. The GPU works through a grid of accounts by transaction keys that's
+  never written out: each key is uploaded once, each account's digits are 64
+  bytes, and a batch of 32,768 items is a slab of the grid, so GPU memory
+  doesn't grow with accounts. The cores do each item's view tags and spend
+  check, against that item's account's spend keys, while the GPU does the
+  next slab.
+- `Arena`: one caller's share of the GPU. The process has one `gpu::Device`
+  (instance, logical device, compute queues, pipelines and their cache, the
+  self-test), and each arena its own buffers, command buffer and fence, about
+  43 MB once used. Arenas share only a queue's lock, for the moment of a
+  submit, and take queues of their own round-robin where the GPU has several.
+  `Keyring::new` and `Prefilter` use the shared arena, one a process as a
+  phone wants; `Keyring::with_arena(Arena::new())` gives a keyring its own,
+  so a server's lanes don't wait on each other's batches.
 - `prototypes/fixtures`: 2,000 real mainnet blocks' transaction keys and view
   tags, from height 3,797,000, for `examples/scan_speed.rs`. The prototypes
   that wrote them are in the git history.
@@ -72,7 +92,20 @@ cargo run --release -p monokulo-8ar --example scan_speed -- \
 ```
 
 Each run prints the XOR of all derivations, which must be `e0c4c620` for this
-fixture. `--tip 1,10,100` measures the energy of small catch-ups on Android
+fixture. `--keys N` runs it through a keyring of N copies of the view key and
+checks every copy's digest. On an RX 6800 XT (RADV, Ryzen 9 5950X, 15
+finishing threads), warm:
+
+| keys | blocks/s | derivations/s | account-blocks/s |
+|---|---|---|---|
+| 1 | 44,300 | 2.53 M | 44,300 |
+| 10 | 4,660 | 2.66 M | 46,600 |
+| 100 | 466 | 2.66 M | 46,600 |
+| 1,000 | 46 | 2.64 M | 46,300 |
+
+The GPU is the limit throughout: about 2.65 million derivations a second
+whatever the account count, so a day of mainnet (720 blocks) for 1,000
+accounts is about 16 s. `--tip 1,10,100` measures the energy of small catch-ups on Android
 (see the example's header). `examples/gpu_check.rs` holds a GPU to
 curve25519-dalek's answers at length.
 
