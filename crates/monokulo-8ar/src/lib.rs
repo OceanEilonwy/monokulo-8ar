@@ -35,14 +35,14 @@ use std::{
     collections::HashSet,
     ops::Range,
     sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
-use gpu::GpuError;
+use gpu::{Derived, GpuError};
 
-use curve25519_dalek::{EdwardsPoint, Scalar, constants::ED25519_BASEPOINT_TABLE};
+use curve25519_dalek::{EdwardsPoint, Scalar, constants::ED25519_BASEPOINT_TABLE, edwards::CompressedEdwardsY};
 use monero_wallet::{
     ViewPair,
     address::{Network, SubaddressIndex},
@@ -147,12 +147,20 @@ fn sendable(key: &[u8; 32]) -> [u8; 32] {
     if canonical(key) { *key } else { CompressedPoint::IDENTITY.to_bytes() }
 }
 
-fn varint(mut n: usize, out: &mut Vec<u8>) {
+/// The longest a usize takes as a varint.
+const MOST_VARINT: usize = usize::BITS.div_ceil(7) as usize;
+
+/// Writes `n` as a varint at the start of `out`, which has room for
+/// [`MOST_VARINT`] bytes, and says how many bytes it took.
+fn varint(mut n: usize, out: &mut [u8]) -> usize {
+    let mut at = 0;
     while n >= 0x80 {
-        out.push(n as u8 | 0x80);
+        out[at] = n as u8 | 0x80;
         n >>= 7;
+        at += 1;
     }
-    out.push(n as u8);
+    out[at] = n as u8;
+    at + 1
 }
 
 /// Runs `each` over `items` on `threads` threads, a chunk at a time.
@@ -229,27 +237,26 @@ impl Account {
             Outputs::All(prefix) => (*prefix, 0..prefix.outputs.len()),
             Outputs::One(prefix, o) => (*prefix, *o..*o + 1),
         };
-        let mut message = Zeroizing::new(Vec::with_capacity(48));
+        // "view_tag", the derivation and the output's index: on the stack, as
+        // this runs for every item, and wiped after.
+        let mut message = Zeroizing::new([0u8; 8 + 32 + MOST_VARINT]);
+        message[..8].copy_from_slice(b"view_tag");
+        message[8..40].copy_from_slice(derivation);
         for o in range {
             let Some(output) = prefix.outputs.get(o) else { continue };
             if output.key == CompressedPoint::IDENTITY {
                 continue;
             }
-            if let Some(tag) = output.view_tag {
-                message.clear();
-                message.extend_from_slice(b"view_tag");
-                message.extend_from_slice(derivation);
-                varint(o, &mut message);
-                if Keccak256::digest(&*message)[0] != tag {
-                    continue;
-                }
+            let end = 40 + varint(o, &mut message[40..]);
+            if let Some(tag) = output.view_tag
+                && Keccak256::digest(&message[..end])[0] != tag
+            {
+                continue;
             }
             let Some(key) = output.key.decompress() else { continue };
             let key: EdwardsPoint = key.into();
-            message.clear();
-            message.extend_from_slice(derivation);
-            varint(o, &mut message);
-            let shared = Zeroizing::new(Scalar::from_bytes_mod_order(Keccak256::digest(&*message).into()));
+            let hash = Zeroizing::new(<[u8; 32]>::from(Keccak256::digest(&message[8..end])));
+            let shared = Zeroizing::new(Scalar::from_bytes_mod_order(*hash));
             let spend = key - (&*shared * ED25519_BASEPOINT_TABLE);
             if self.spends.contains(spend.compress().as_bytes()) {
                 return true;
@@ -264,6 +271,8 @@ impl Account {
 trait Deriver {
     /// The most items a slab takes.
     fn batch(&self) -> usize;
+    /// The most keys and the most accounts a load takes.
+    fn most(&self) -> (usize, usize);
     fn load(&mut self, accounts: &[&gpu::Digits], keys: &[[u8; 32]]) -> Result<(), GpuError>;
     fn slab(&mut self, first_item: u64, count: usize) -> Result<gpu::Points, GpuError>;
     fn unload(&mut self);
@@ -274,6 +283,10 @@ struct OnGpu<'a>(&'a gpu::Arena);
 impl Deriver for OnGpu<'_> {
     fn batch(&self) -> usize {
         self.0.tuning().batch
+    }
+
+    fn most(&self) -> (usize, usize) {
+        (self.0.most_keys(), self.0.most_accounts())
     }
 
     fn load(&mut self, accounts: &[&gpu::Digits], keys: &[[u8; 32]]) -> Result<(), GpuError> {
@@ -380,11 +393,14 @@ impl Keyring {
         }
         let accounts = self.accounts.len();
         let mut hits: Vec<Hit> = whole.iter().flat_map(|&block| (0..accounts).map(move |a| Hit { account: AccountId(a as u32), block, tx: Hit::WHOLE_BLOCK })).collect();
-        if accounts > 0 && !jobs.is_empty() {
-            let digits: Vec<&gpu::Digits> = self.accounts.iter().map(|a| &a.digits).collect();
-            let per_load = (MOST_ITEMS / accounts as u64).max(1) as usize;
+        // As many loads as the GPU needs: each within its buffers' bounds, and
+        // the grid's items countable in 32 bits.
+        let (most_keys, most_accounts) = deriver.most();
+        for first_account in (0..accounts).step_by(most_accounts.max(1)) {
+            let these = first_account..accounts.min(first_account + most_accounts.max(1));
+            let per_load = (MOST_ITEMS / these.len() as u64).max(1).min(most_keys.max(1) as u64) as usize;
             for part in jobs.chunks(per_load) {
-                hits.extend(self.on_grid(part, &digits, threads, deriver)?);
+                hits.extend(self.on_grid(part, these.clone(), threads, deriver)?);
             }
         }
         hits.sort_unstable();
@@ -392,50 +408,64 @@ impl Keyring {
         Ok(Some(hits))
     }
 
-    /// Every account with every one of `jobs`' keys: the deriver works out a slab
-    /// while the cores finish the last.
-    fn on_grid(&self, jobs: &[Job], digits: &[&gpu::Digits], threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
+    /// Every account with every one of `jobs`' keys: the deriver works out a
+    /// slab, then the cores finish it, one after the other and never side by
+    /// side, as a scan runs on the GPU or the CPU and never both.
+    fn on_grid(&self, jobs: &[Job], accounts: Range<usize>, threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
         let keys: Vec<[u8; 32]> = jobs.iter().map(|job| sendable(&job.key)).collect();
-        deriver.load(digits, &keys)?;
-        let items = (jobs.len() * digits.len()) as u64;
+        let digits: Vec<&gpu::Digits> = self.accounts[accounts.clone()].iter().map(|a| &a.digits).collect();
+        deriver.load(&digits, &keys)?;
+        let result = self.slabs(jobs, &keys, accounts, threads, deriver);
+        deriver.unload();
+        result
+    }
+
+    /// The slabs of what's loaded, each finished on the cores before the next.
+    /// An answer the GPU can't have got right is an error, which retires it, and
+    /// the caller then scans every block with the `Scanner`: a point that fails
+    /// the GPU's own check or the CPU's, or a key said to be off the curve that
+    /// isn't. Each answer stands alone, so one bad point says nothing of the
+    /// others, but nothing from a faulty GPU is trusted.
+    fn slabs(&self, jobs: &[Job], keys: &[[u8; 32]], accounts: Range<usize>, threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
+        let items = (jobs.len() * accounts.len()) as u64;
         let batch = deriver.batch() as u64;
         let found = Mutex::new(vec![]);
-        let result = std::thread::scope(|scope| {
-            // The GPU goes on to its next slab while the cores finish its last.
-            let (done, finishing) = std::sync::mpsc::sync_channel::<(u64, gpu::Points)>(1);
-            let found = &found;
-            scope.spawn(move || {
-                for (first, points) in finishing {
-                    in_ranges(points.len(), threads, CHUNK, |range| {
-                        let mut hits = vec![];
-                        for i in range {
-                            let item = first + i as u64;
-                            let (account, job) = ((item / jobs.len() as u64) as usize, &jobs[(item % jobs.len() as u64) as usize]);
-                            // Off the curve is the identity, as Monero treats it.
-                            let derivation = Zeroizing::new(points.get(i).unwrap_or(IDENTITY));
-                            if self.accounts[account].pays(&derivation, &job.outputs) {
-                                hits.push(Hit { account: AccountId(account as u32), block: job.block, tx: job.tx });
-                            }
+        let wrong = AtomicBool::new(false);
+        // Whether each key is off the curve, as curve25519-dalek finds when the GPU
+        // says one is, which is rare: once a key, not once an account.
+        let off_curve: Vec<OnceLock<bool>> = keys.iter().map(|_| OnceLock::new()).collect();
+        let mut first = 0;
+        while first < items {
+            let points = deriver.slab(first, batch.min(items - first) as usize)?;
+            in_ranges(points.len(), threads, CHUNK, |range| {
+                let mut hits = vec![];
+                for i in range {
+                    let item = first + i as u64;
+                    let (account, key) = (accounts.start + (item / jobs.len() as u64) as usize, (item % jobs.len() as u64) as usize);
+                    let derivation = match points.derived(i) {
+                        Derived::Point(point) => Zeroizing::new(point),
+                        // Off the curve is the identity, as Monero treats it.
+                        Derived::OffCurve if *off_curve[key].get_or_init(|| CompressedEdwardsY(keys[key]).decompress().is_none()) => Zeroizing::new(IDENTITY),
+                        Derived::OffCurve | Derived::Wrong => {
+                            wrong.store(true, Ordering::Relaxed);
+                            return;
                         }
-                        if !hits.is_empty() {
-                            found.lock().expect("hits lock").extend(hits);
-                        }
-                    });
+                    };
+                    let job = &jobs[key];
+                    if self.accounts[account].pays(&derivation, &job.outputs) {
+                        hits.push(Hit { account: AccountId(account as u32), block: job.block, tx: job.tx });
+                    }
+                }
+                if !hits.is_empty() {
+                    found.lock().expect("hits lock").extend(hits);
                 }
             });
-            let mut first = 0;
-            while first < items {
-                let points = deriver.slab(first, batch.min(items - first) as usize)?;
-                if done.send((first, points)).is_err() {
-                    // The finishing thread has gone only by panicking, which the scope passes on.
-                    break;
-                }
-                first += batch;
+            if wrong.load(Ordering::Relaxed) {
+                return Err(GpuError { what: "a point the GPU got wrong".into(), kind: gpu::GpuErrorKind::Failed });
             }
-            Ok(())
-        });
-        deriver.unload();
-        result.map(|()| found.into_inner().expect("hits lock"))
+            first += batch;
+        }
+        Ok(found.into_inner().expect("hits lock"))
     }
 }
 
@@ -479,10 +509,16 @@ fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>)
     if block.block.transactions.len() != block.transactions.len() || block.block.header.hardfork_version > NEWEST_FORK {
         return false;
     }
-    if block.output_index_for_first_ringct_output.is_none() {
-        return true;
-    }
+    let Some(first_ringct_output) = block.output_index_for_first_ringct_output else { return true };
     let miner = block.block.miner_transaction();
+    // The Scanner refuses a block whose RingCT outputs' indexes pass u64::MAX.
+    let ringct_outputs = std::iter::once(miner.prefix())
+        .filter(|_| matches!(miner, Transaction::V2 { .. }))
+        .chain(block.transactions.iter().filter(|tx| matches!(tx, Transaction::V2 { .. })).map(Transaction::prefix))
+        .try_fold(first_ringct_output, |at, prefix| at.checked_add(prefix.outputs.len() as u64));
+    if ringct_outputs.is_none() {
+        return false;
+    }
     let mut add = |tx: usize, version: u64, prefix: &'a TransactionPrefix| {
         if version != 2 {
             return;

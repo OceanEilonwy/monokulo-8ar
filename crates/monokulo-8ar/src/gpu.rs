@@ -2,8 +2,9 @@
 //!
 //! The GPU does the curve arithmetic, inverts each point's Z and hands back the
 //! compressed points; the CPU does everything after. A key that isn't on the
-//! curve comes back marked. Any Vulkan failure is an error for the caller, which
-//! then scans without the prefilter. Nothing here panics: a driver's behaviour
+//! curve comes back marked, and so does a point the GPU's own check finds off
+//! it, which only a fault makes. Any Vulkan failure is an error for the caller,
+//! which then scans without the prefilter. Nothing here panics: a driver's behaviour
 //! is outside what the wallet can vouch for.
 //!
 //! A [`Device`] is the GPU, set up once a process: the instance, the logical
@@ -49,7 +50,9 @@ impl Digits {
 
     pub fn new(scalar: &[u8; 32]) -> Digits {
         assert!(scalar[31] <= 127);
-        let mut d = [0i8; 64];
+        // Worked out where they're kept, which is wiped on drop, not in a copy.
+        let mut digits = Digits([0; 64]);
+        let d = &mut digits.0;
         for i in 0..32 {
             d[2 * i] = (scalar[i] & 15) as i8;
             d[2 * i + 1] = ((scalar[i] >> 4) & 15) as i8;
@@ -59,14 +62,15 @@ impl Digits {
             d[i] -= c << 4;
             d[i + 1] += c;
         }
-        Digits(d)
+        digits
     }
 }
 
 const SPIRV: &[u8] = include_bytes!("../shaders/scan.spv");
 /// A work item's state on the GPU: 300 words.
 const STATE_BYTES: u64 = 300 * 4;
-/// A work item's result: the compressed point, then whether the key was off the curve.
+/// A work item's result: the compressed point, then a flag: 1 if the key was off
+/// the curve, 2 if the point failed the GPU's own check.
 const OUT_WORDS: usize = 9;
 /// An account's digits on the GPU: 64 signed bytes.
 const ACCOUNT_BYTES: usize = 64;
@@ -79,6 +83,11 @@ const PUSH_BYTES: u32 = 20;
 const MOST_QUEUES: u32 = 4;
 /// Storage buffers: keys, state, results, account digits.
 const BINDINGS: u32 = 4;
+/// The most keys one load takes, 32 MB of them, however many more a GPU's
+/// buffers could hold: the caller splits a bigger load.
+const MOST_KEYS: usize = 1 << 20;
+/// The most accounts one load takes: 64 MB of digits.
+const MOST_ACCOUNTS: usize = 1 << 20;
 
 /// How the work is cut up.
 #[derive(Clone, Copy, Debug)]
@@ -96,9 +105,9 @@ pub struct Tuning {
 /// Tuned on a Mali-G715: 16 windows hold a key's state in the shader longest, and a dispatch to about 60 ms.
 pub const TUNING: Tuning = Tuning { batch: 32_768, windows: 16, submit_every: 1, group: 64 };
 
-/// A discrete GPU has no dispatch near its watchdog, so a batch is one submit. Smaller
-/// batches would let the cores finish more while it works, but on an RX 6800 XT a batch
-/// costs at least 3.7 ms however small: 8,192 keys were slower overall, and 16,384 no faster.
+/// A discrete GPU has no dispatch near its watchdog, so a batch is one submit. On an
+/// RX 6800 XT a batch costs at least 3.7 ms however small: 8,192 keys were slower
+/// overall, and 16,384 no faster.
 pub const DISCRETE_TUNING: Tuning = Tuning { submit_every: 8, ..TUNING };
 
 /// What went wrong, for the log. Never holds key material.
@@ -133,6 +142,16 @@ fn failed(what: &str) -> impl Fn(vk::Result) -> GpuError + '_ {
     move |e| GpuError::failed(format!("{what}: {e}"))
 }
 
+/// One item of [`Points`].
+pub enum Derived {
+    /// 8aR, compressed. Wipe it when done.
+    Point([u8; 32]),
+    /// The key wasn't on the curve, the GPU says: Monero takes it as the identity.
+    OffCurve,
+    /// Not an answer the GPU could have got right: it's faulty.
+    Wrong,
+}
+
 /// What the GPU worked out for a batch of items. Copied out whole first, as
 /// reading the GPU's memory a word at a time is slow on a phone, and decoded by
 /// whichever thread takes each point.
@@ -144,17 +163,39 @@ impl Points {
         Points(Zeroizing::new(words))
     }
 
-    /// Item `i`'s point, compressed, or `None` if its key wasn't on the curve.
-    /// Wipe it when done: it's the key's shared secret with the wallet.
+    /// Item `i`'s point, compressed, or `None` if its key wasn't on the curve or
+    /// the GPU says it went wrong. Wipe it when done: it's the key's shared
+    /// secret with the wallet.
     pub fn get(&self, i: usize) -> Option<[u8; 32]> {
+        match self.derived(i) {
+            Derived::Point(bytes) => Some(bytes),
+            Derived::OffCurve | Derived::Wrong => None,
+        }
+    }
+
+    /// Item `i` as the GPU handed it back, with what the CPU can check cheaply
+    /// held against it: a flag it knows, and a point that's a canonical encoding
+    /// and not y = 0. That point has order 4, which 8aR never has; it's what a
+    /// zero Z comes out as.
+    pub fn derived(&self, i: usize) -> Derived {
         let word = &self.0[i * OUT_WORDS..(i + 1) * OUT_WORDS];
-        (word[8] == 0).then(|| {
-            let mut bytes = [0; 32];
-            for (limb, out) in word[..8].iter().zip(bytes.as_chunks_mut::<4>().0) {
-                *out = limb.to_le_bytes();
+        match word[8] {
+            0 => {
+                let mut bytes = [0; 32];
+                for (limb, out) in word[..8].iter().zip(bytes.as_chunks_mut::<4>().0) {
+                    *out = limb.to_le_bytes();
+                }
+                let y_is_zero = bytes[..31].iter().all(|b| *b == 0) && bytes[31] & 0x7f == 0;
+                if crate::canonical(&bytes) && !y_is_zero {
+                    Derived::Point(bytes)
+                } else {
+                    bytes.zeroize();
+                    Derived::Wrong
+                }
             }
-            bytes
-        })
+            1 => Derived::OffCurve,
+            _ => Derived::Wrong,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -186,6 +227,8 @@ pub struct Device {
     last: vk::Pipeline,
     check: vk::Pipeline,
     tuning: Tuning,
+    /// The most bytes a storage buffer's binding may span.
+    range: u64,
     name: String,
     driver: u32,
 }
@@ -256,6 +299,7 @@ impl Device {
             };
             let properties = instance.get_physical_device_properties(physical);
             let driver = properties.driver_version;
+            let range = u64::from(properties.limits.max_storage_buffer_range);
             let tuning = tuning.unwrap_or(match properties.device_type {
                 vk::PhysicalDeviceType::DISCRETE_GPU => DISCRETE_TUNING,
                 _ => TUNING,
@@ -293,6 +337,7 @@ impl Device {
                 last: vk::Pipeline::null(),
                 check: vk::Pipeline::null(),
                 tuning,
+                range,
                 name,
                 driver,
             };
@@ -535,6 +580,17 @@ impl Arena {
         self.gpu.tuning
     }
 
+    /// The most keys one [`load`](Arena::load) takes: what a buffer binding can
+    /// span, and at most a million.
+    pub fn most_keys(&self) -> usize {
+        usize::try_from(self.gpu.range / 32).unwrap_or(usize::MAX).min(MOST_KEYS)
+    }
+
+    /// The most accounts one [`load`](Arena::load) takes, in the same way.
+    pub fn most_accounts(&self) -> usize {
+        usize::try_from(self.gpu.range / ACCOUNT_BYTES as u64).unwrap_or(usize::MAX).min(MOST_ACCOUNTS)
+    }
+
     /// A buffer in the first memory type with all of one of `wanted`'s flags.
     unsafe fn buffer(&self, size: u64, wanted: &[vk::MemoryPropertyFlags]) -> Result<Buffer, GpuError> {
         unsafe {
@@ -697,6 +753,8 @@ impl Arena {
                 if let Ok(queue) = self.gpu.queues[self.queue].lock() {
                     let _ = device.queue_wait_idle(*queue);
                 }
+                // A fence still signalled can't go with the next submit.
+                let _ = device.reset_fences(&[self.fence]);
                 return Err(failed("waiting")(e));
             }
             device.reset_fences(&[self.fence]).map_err(failed("fence"))?;
@@ -757,14 +815,16 @@ impl Arena {
         result
     }
 
-    /// Puts `keys` (canonical; fewer than 2^31 items in all) and the accounts'
-    /// digits on the GPU, for [`slab`](Arena::slab) to take items of the grid
-    /// from: item `g` is key `g % keys.len()` with account `g / keys.len()`.
-    /// [`unload`](Arena::unload) wipes the digits again.
+    /// Puts `keys` (canonical; fewer than 2^31 items in all, at most
+    /// [`most_keys`](Arena::most_keys) keys and [`most_accounts`](Arena::most_accounts)
+    /// accounts) and the accounts' digits on the GPU, for [`slab`](Arena::slab)
+    /// to take items of the grid from: item `g` is key `g % keys.len()` with
+    /// account `g / keys.len()`. [`unload`](Arena::unload) wipes the digits again.
     pub fn load(&self, accounts: &[&Digits], keys: &[[u8; 32]]) -> Result<(), GpuError> {
         let items = keys.len() as u64 * accounts.len() as u64;
-        if items >= 1 << 31 {
-            return Err(GpuError::failed(format!("{items} items in one load")));
+        // A binding past the GPU's range is undefined, and the shader indexes keys in 32 bits.
+        if items >= 1 << 31 || keys.len() > self.most_keys() || accounts.len() > self.most_accounts() {
+            return Err(GpuError::failed(format!("{} keys and {} accounts in one load", keys.len(), accounts.len())));
         }
         let result = unsafe {
             let batch = (items as usize).min(self.gpu.tuning.batch).max(1) as u32;
@@ -834,8 +894,16 @@ impl Arena {
     }
 
     /// One field operation on each pair: for the tests. 0 adds, 1 subtracts,
-    /// 2 multiplies, 3 squares, 4 negates and 5 only reduces.
+    /// 2 multiplies, 3 squares, 4 negates and 5 only reduces. At most
+    /// [`Tuning::batch`] pairs.
     pub fn check_field(&self, op: u32, pairs: &[([u32; 8], [u32; 8])]) -> Result<Vec<[u32; 8]>, GpuError> {
+        if pairs.is_empty() {
+            // Nothing to dispatch, and clearing no bytes of state isn't allowed.
+            return Ok(vec![]);
+        }
+        if pairs.len() > self.gpu.tuning.batch {
+            return Err(GpuError::failed(format!("{} pairs at once", pairs.len())));
+        }
         let mut input = Vec::with_capacity(pairs.len() * 64);
         for (a, b) in pairs {
             for limb in a.iter().chain(b) {

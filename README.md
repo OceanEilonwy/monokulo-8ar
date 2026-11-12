@@ -21,7 +21,8 @@ arithmetic: without a GPU, the caller scans every block with the `Scanner`,
 which is slower but needs nothing from this crate. Any Vulkan GPU will do,
 integrated ones included; Apple's GPUs are meant to come later through
 MoltenVK. A GPU is only trusted after it passes test vectors, once per
-process, and again with each wallet's own view key. A GPU that fails is
+process, and again with each wallet's own view key, and each point it hands
+back is checked: one off the curve fails the batch. A GPU that fails is
 retired until the process restarts. Which way a batch goes is a matter of
 speed and power, never of the answer.
 
@@ -43,9 +44,10 @@ speed and power, never of the answer.
   one. The GPU works through a grid of accounts by transaction keys that's
   never written out: each key is uploaded once, each account's digits are 64
   bytes, and a batch of 32,768 items is a slab of the grid, so GPU memory
-  doesn't grow with accounts. The cores do each item's view tags and spend
-  check, against that item's account's spend keys, while the GPU does the
-  next slab.
+  doesn't grow with accounts. Once the GPU has done a slab, the cores do each
+  item's view tags and spend check, against that item's account's spend keys:
+  one after the other, never side by side, as a scan runs on the GPU or the
+  CPU and never both.
 - `Arena`: one caller's share of the GPU. The process has one `gpu::Device`
   (instance, logical device, compute queues, pipelines and their cache, the
   self-test), and each arena its own buffers, command buffer and fence, about
@@ -98,14 +100,15 @@ finishing threads), warm:
 
 | keys | blocks/s | derivations/s | account-blocks/s |
 |---|---|---|---|
-| 1 | 44,300 | 2.53 M | 44,300 |
-| 10 | 4,660 | 2.66 M | 46,600 |
-| 100 | 466 | 2.66 M | 46,600 |
-| 1,000 | 46 | 2.64 M | 46,300 |
+| 1 | 39,300 | 2.24 M | 39,300 |
+| 10 | 3,960 | 2.26 M | 39,600 |
+| 100 | 386 | 2.20 M | 38,600 |
+| 1,000 | 38 | 2.20 M | 38,500 |
 
-The GPU is the limit throughout: about 2.65 million derivations a second
-whatever the account count, so a day of mainnet (720 blocks) for 1,000
-accounts is about 16 s. `--tip 1,10,100` measures the energy of small catch-ups on Android
+The GPU does about 2.65 million derivations a second whatever the account
+count; the cores' view tags, after each slab rather than beside the next,
+bring that to about 2.2 million. So a day of mainnet (720 blocks) for 1,000
+accounts is about 19 s. `--tip 1,10,100` measures the energy of small catch-ups on Android
 (see the example's header). `examples/gpu_check.rs` holds a GPU to
 curve25519-dalek's answers at length.
 

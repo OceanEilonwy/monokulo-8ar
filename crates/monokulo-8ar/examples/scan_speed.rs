@@ -238,41 +238,31 @@ fn main() {
         let mut gpu_seconds = 0.0;
         // Each copy's digest and tags, all of which must be the one key's.
         let mut each = vec![([0u8; 32], 0u64); copies];
-        // As a keyring does: the GPU goes on while the cores finish the last batch.
-        std::thread::scope(|scope| {
-            let (done, finishing) = std::sync::mpsc::sync_channel::<(u64, monokulo_8ar::gpu::Points)>(1);
-            let (jobs, each) = (&jobs, &mut each);
-            let finisher = scope.spawn(move || {
-                for (first, points) in finishing {
-                    // The slab a piece at a time, each piece within one account's row.
-                    let mut at = 0;
-                    while at < points.len() {
-                        let item = first + at as u64;
-                        let (account, key) = ((item / jobs.len() as u64) as usize, (item % jobs.len() as u64) as usize);
-                        let end = (at + jobs.len() - key).min(points.len());
-                        let result = in_parallel(end - at, threads, 64, |from, to| {
-                            let derivations: Vec<_> = (at + from..at + to).map(|i| points.get(i).expect("on the curve")).collect();
-                            finish(&derivations, &jobs[key + from..key + to])
-                        });
-                        each[account].0.iter_mut().zip(result.0).for_each(|(a, d)| *a ^= d);
-                        each[account].1 += result.1;
-                        at = end;
-                    }
-                }
-            });
-            gpu.load(&accounts, &keys).expect("the GPU took the keys");
-            let mut first = 0;
-            while first < items {
-                let t = Instant::now();
-                let points = gpu.slab(first, (tuning.batch as u64).min(items - first) as usize).expect("the GPU ran");
-                gpu_seconds += t.elapsed().as_secs_f64();
-                done.send((first, points)).unwrap();
-                first += tuning.batch as u64;
+        // As a keyring does: the GPU works out a slab, then the cores finish it,
+        // one after the other and never side by side.
+        gpu.load(&accounts, &keys).expect("the GPU took the keys");
+        let mut first = 0;
+        while first < items {
+            let t = Instant::now();
+            let points = gpu.slab(first, (tuning.batch as u64).min(items - first) as usize).expect("the GPU ran");
+            gpu_seconds += t.elapsed().as_secs_f64();
+            // The slab a piece at a time, each piece within one account's row.
+            let mut at = 0;
+            while at < points.len() {
+                let item = first + at as u64;
+                let (account, key) = ((item / jobs.len() as u64) as usize, (item % jobs.len() as u64) as usize);
+                let end = (at + jobs.len() - key).min(points.len());
+                let result = in_parallel(end - at, threads, 64, |from, to| {
+                    let derivations: Vec<_> = (at + from..at + to).map(|i| points.get(i).expect("on the curve")).collect();
+                    finish(&derivations, &jobs[key + from..key + to])
+                });
+                each[account].0.iter_mut().zip(result.0).for_each(|(a, d)| *a ^= d);
+                each[account].1 += result.1;
+                at = end;
             }
-            gpu.unload();
-            drop(done);
-            finisher.join().unwrap();
-        });
+            first += tuning.batch as u64;
+        }
+        gpu.unload();
         let seconds = started.elapsed().as_secs_f64();
         let hex: String = each[0].0[..4].iter().map(|b| format!("{b:02x}")).collect();
         println!(
