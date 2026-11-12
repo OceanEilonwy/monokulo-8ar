@@ -117,16 +117,49 @@ fn dalek_hits(keyring: &Keyring, views: &[Scalar], blocks: &[ScannableBlock], th
 }
 
 /// How a test has blocks flagged: the GPU, or curve25519-dalek in its place.
-type Flagger = fn(&Prefilter, &Scalar, &[ScannableBlock], usize) -> Vec<bool>;
+type Flagger = fn(&Prefilter, &Scalar, &[ScannableBlock], usize) -> Vec<Txs>;
 
 /// The prefilter with curve25519-dalek doing the GPU's part, in batches of 100
 /// keys so that a few blocks take several.
-fn by_dalek(filter: &Prefilter, view: &Scalar, blocks: &[ScannableBlock], threads: usize) -> Vec<bool> {
-    flags(&dalek_hits(&filter.0, &[*view], blocks, threads, 100), blocks.len())
+fn by_dalek(filter: &Prefilter, view: &Scalar, blocks: &[ScannableBlock], threads: usize) -> Vec<Txs> {
+    let hits = dalek_hits(&filter.0, &[*view], blocks, threads, 100);
+    let txs = txs(&hits, blocks.len());
+    assert_eq!(flagged(&txs), flags(&hits, blocks.len()), "a block's flagged exactly when a transaction in it is");
+    txs
 }
 
-fn by_gpu(filter: &Prefilter, _view: &Scalar, blocks: &[ScannableBlock], threads: usize) -> Vec<bool> {
-    filter.flag(blocks, threads, 0).expect("the GPU filtered")
+fn by_gpu(filter: &Prefilter, _view: &Scalar, blocks: &[ScannableBlock], threads: usize) -> Vec<Txs> {
+    let txs = filter.flag_txs(blocks, threads, 0).expect("the GPU filtered");
+    assert_eq!(filter.flag(blocks, threads, 0), Some(flagged(&txs)), "a block's flagged exactly when a transaction in it is");
+    txs
+}
+
+fn flagged(txs: &[Txs]) -> Vec<bool> {
+    txs.iter().map(Txs::flagged).collect()
+}
+
+/// The transactions the `Scanner` finds money in, reading `block` whole,
+/// numbered as [`Txs`] numbers them.
+fn found_in(scanner: &Scanner, block: &ScannableBlock) -> Vec<usize> {
+    let Ok(found) = scanner.clone().scan(block.clone()) else { return vec![] };
+    let miner = block.block.miner_transaction().hash();
+    let mut txs: Vec<usize> = found
+        .ignore_additional_timelock()
+        .iter()
+        .map(|output| {
+            let hash = output.transaction();
+            if hash == miner { 0 } else { 1 + block.block.transactions.iter().position(|h| *h == hash).expect("a transaction in the block") }
+        })
+        .collect();
+    txs.dedup();
+    txs
+}
+
+/// Every transaction the `Scanner` finds money in is one the prefilter flagged.
+fn never_misses(name: &str, scanner: &Scanner, block: &ScannableBlock, txs: &Txs) {
+    for tx in found_in(scanner, block) {
+        assert!(txs.has(tx), "{name}: transaction {tx} pays and isn't flagged, in {txs:?}");
+    }
 }
 
 /// The first small y that isn't on the curve, canonically encoded.
@@ -293,7 +326,9 @@ fn scanner_finds(scanner: &Scanner, block: ScannableBlock) -> bool {
 
 fn agree(name: &str, flag: Flagger, w: &Wallet, filter: &Prefilter, scanner: &Scanner, block: ScannableBlock, expected: bool) {
     assert_eq!(scanner_finds(scanner, block.clone()), expected, "{name}: the Scanner's answer isn't the one this case is about");
-    assert_eq!(flag(filter, &w.view, std::slice::from_ref(&block), 1)[0], expected, "{name}");
+    let txs = &flag(filter, &w.view, std::slice::from_ref(&block), 1)[0];
+    assert_eq!(txs.flagged(), expected, "{name}");
+    never_misses(name, scanner, &block, txs);
 }
 
 #[test]
@@ -318,6 +353,7 @@ fn the_gpu_flags_the_same_blocks() {
     assert!(matches!(engine(), Engine::Gpu { .. }));
     every_way_of_being_paid(by_gpu);
     many_blocks(by_gpu);
+    only_the_paying_transactions(by_gpu);
     let mut rng = StdRng::seed_from_u64(8);
     // More than one of the GPU's batches.
     let mut blocks = vec![];
@@ -330,7 +366,8 @@ fn the_gpu_flags_the_same_blocks() {
         expected.push(pays);
     }
     assert_eq!(filter.flag(&blocks, 4, 0), Some(expected.clone()));
-    assert_eq!(by_dalek(&filter, &w.view, &blocks, 4), expected);
+    assert_eq!(flagged(&by_dalek(&filter, &w.view, &blocks, 4)), expected);
+    assert_eq!(filter.flag_txs(&blocks, 4, 0), Some(by_dalek(&filter, &w.view, &blocks, 4)));
     // Too few keys to be worth the GPU: the caller scans every block.
     assert_eq!(filter.flag(&blocks, 4, blocks.len() + 1), None);
     assert!(engine::gpu_ready(), "and it hasn't been retired");
@@ -398,13 +435,17 @@ fn every_way_of_being_paid(flag: Flagger) {
     no_ringct.output_index_for_first_ringct_output = None;
     agree("no RingCT outputs", flag, &w, &filter, &scanner, no_ringct, false);
 
-    // The Scanner's refusals stay the Scanner's to make.
+    // The Scanner's refusals stay the Scanner's to make, and it reads those blocks whole.
+    let newer = block_with(vec![stranger(&mut rng)], extra_of(&[key], None), NEWEST_FORK + 1, 0);
+    assert_eq!(flag(&filter, &w.view, std::slice::from_ref(&newer), 1), [Txs::All], "a newer fork, whole");
     agree("a newer fork", flag, &w, &filter, &scanner, block_with(vec![stranger(&mut rng)], extra_of(&[key], None), NEWEST_FORK + 1, 0), true);
     let mut mismatched = block_of(vec![stranger(&mut rng)], extra_of(&[key], None));
     mismatched.block = Block::new(mismatched.block.header.clone(), mismatched.block.miner_transaction().clone(), vec![[1; 32]]).unwrap();
+    assert_eq!(flag(&filter, &w.view, std::slice::from_ref(&mismatched), 1), [Txs::All], "transactions missing, whole");
     agree("transactions missing", flag, &w, &filter, &scanner, mismatched, true);
     let mut past_the_last_index = block_of(vec![stranger(&mut rng)], extra_of(&[key], None));
     past_the_last_index.output_index_for_first_ringct_output = Some(u64::MAX);
+    assert_eq!(flag(&filter, &w.view, std::slice::from_ref(&past_the_last_index), 1), [Txs::All], "past u64::MAX, whole");
     agree("output indexes past u64::MAX", flag, &w, &filter, &scanner, past_the_last_index, true);
     let mut at_the_last_index = block_of(vec![stranger(&mut rng)], extra_of(&[key], None));
     at_the_last_index.output_index_for_first_ringct_output = Some(u64::MAX - 1);
@@ -419,10 +460,77 @@ fn payments_in_ordinary_transactions_are_flagged_among_many_blocks() {
 fn many_blocks(flag: Flagger) {
     let (w, filter, scanner) = wallet();
     let (blocks, expected) = many_blocks_for(&w);
-    assert_eq!(flag(&filter, &w.view, &blocks, 4), expected);
-    assert_eq!(flag(&filter, &w.view, &blocks, 1), expected);
-    for (block, pays) in blocks.into_iter().zip(expected) {
-        assert_eq!(scanner_finds(&scanner, block), pays, "the Scanner has the same answer");
+    let txs = flag(&filter, &w.view, &blocks, 4);
+    assert_eq!(flagged(&txs), expected);
+    assert_eq!(flag(&filter, &w.view, &blocks, 1), txs);
+    for ((block, pays), txs) in blocks.into_iter().zip(expected).zip(txs) {
+        // The second ordinary transaction, after the miner's.
+        assert_eq!(txs, if pays { Txs::These(vec![2]) } else { Txs::Clear });
+        assert_eq!(found_in(&scanner, &block), if pays { vec![2] } else { vec![] }, "the Scanner has the same answer");
+    }
+}
+
+#[test]
+fn only_the_transactions_that_may_pay_are_flagged() {
+    only_the_paying_transactions(by_dalek);
+}
+
+/// A transaction's outputs and extra, from its key.
+type Outputting<'a> = dyn Fn(&mut StdRng, &Scalar) -> (Vec<Output>, Vec<u8>) + 'a;
+
+/// A block of several transactions, some paying the wallet each way and some
+/// not: the paying ones are flagged, by their place, and only those.
+fn only_the_paying_transactions(flag: Flagger) {
+    let (w, filter, scanner) = wallet();
+    let mut rng = StdRng::seed_from_u64(14);
+    let sub: EdwardsPoint = w.pair.subaddress(Network::Mainnet, SubaddressIndex::new(0, SUBADDRESS).unwrap()).spend().into();
+    let unwatched: EdwardsPoint = w.pair.subaddress(Network::Mainnet, SubaddressIndex::new(0, SUBADDRESS + 1).unwrap()).spend().into();
+    let tx = |rng: &mut StdRng, version: u8, outputs: &Outputting| {
+        let r = random_scalar(rng);
+        let (outputs, extra) = outputs(rng, &r);
+        let prefix = TransactionPrefix { additional_timelock: Timelock::None, inputs: vec![], outputs, extra };
+        if version == 1 { Transaction::<Pruned>::V1 { prefix, signatures: () } } else { Transaction::<Pruned>::V2 { prefix, proofs: None } }
+    };
+    let plain = |rng: &mut StdRng, r: &Scalar| (vec![stranger(rng), stranger(rng)], extra_of(&[point_of(r)], None));
+    let transactions = vec![
+        tx(&mut rng, 2, &plain),
+        tx(&mut rng, 2, &|rng, r| (vec![stranger(rng), paying(&w, r, 1, w.spend)], extra_of(&[point_of(r)], None))),
+        // Paid in a v1 transaction, which the Scanner doesn't read.
+        tx(&mut rng, 1, &|_, r| (vec![paying(&w, r, 0, w.spend)], extra_of(&[point_of(r)], None))),
+        tx(&mut rng, 2, &|rng, r| {
+            let other = point_of(&random_scalar(rng));
+            (vec![stranger(rng), stranger(rng), paying(&w, r, 2, sub)], extra_of(&[other], Some(&[other, other, point_of(r)])))
+        }),
+        tx(&mut rng, 2, &|rng, r| {
+            let mut untagged = stranger(rng);
+            untagged.view_tag = None;
+            (vec![untagged], extra_of(&[point_of(r)], None))
+        }),
+        tx(&mut rng, 2, &|_, r| (vec![paying(&w, r, 0, unwatched)], extra_of(&[point_of(r)], None))),
+        tx(&mut rng, 2, &|rng, r| {
+            let mut untagged = paying(&w, r, 0, w.spend);
+            untagged.view_tag = None;
+            (vec![untagged, stranger(rng)], extra_of(&[point_of(r)], None))
+        }),
+        tx(&mut rng, 2, &plain),
+    ];
+    let with_miner = |miner: Vec<Output>, extra: Vec<u8>| {
+        let mut block = block_of(miner, extra);
+        block.transactions = transactions.clone();
+        let hashes = (0..transactions.len()).map(|t| [t as u8 + 1; 32]).collect();
+        block.block = Block::new(block.block.header.clone(), block.block.miner_transaction().clone(), hashes).unwrap();
+        block
+    };
+    let r = random_scalar(&mut rng);
+    let unpaid_miner = with_miner(vec![stranger(&mut rng)], extra_of(&[point_of(&r)], None));
+    let paid_miner = with_miner(vec![stranger(&mut rng), paying(&w, &r, 1, w.spend)], extra_of(&[point_of(&r)], None));
+    let blocks = [unpaid_miner, paid_miner];
+    let txs = flag(&filter, &w.view, &blocks, 1);
+    assert_eq!(txs, [Txs::These(vec![2, 4, 7]), Txs::These(vec![0, 2, 4, 7])]);
+    assert_eq!(flag(&filter, &w.view, &blocks, 4), txs);
+    for (block, txs) in blocks.iter().zip(&txs) {
+        let Txs::These(list) = txs else { unreachable!() };
+        assert_eq!(&found_in(&scanner, block), list, "the Scanner finds money in those, and only those");
     }
 }
 
@@ -441,7 +549,7 @@ fn many_blocks_for(w: &Wallet) -> (Vec<ScannableBlock>, Vec<bool>) {
             let prefix = TransactionPrefix { additional_timelock: Timelock::None, inputs: vec![], outputs, extra: extra_of(&[point_of(&r)], None) };
             block.transactions.push(Transaction::<Pruned>::V2 { prefix, proofs: None });
         }
-        let hashes = vec![[0; 32]; block.transactions.len()];
+        let hashes = (0..block.transactions.len()).map(|t| Keccak256::digest(format!("{i} {t}")).into()).collect();
         block.block = Block::new(block.block.header.clone(), block.block.miner_transaction().clone(), hashes).unwrap();
         expected.push(pays);
         blocks.push(block);
