@@ -96,9 +96,9 @@ pub struct Tuning {
 /// Tuned on a Mali-G715: 16 windows hold a key's state in the shader longest, and a dispatch to about 60 ms.
 pub const TUNING: Tuning = Tuning { batch: 32_768, windows: 16, submit_every: 1, group: 64 };
 
-/// A discrete GPU has no dispatch near its watchdog, so a batch is one submit. Smaller
-/// batches would let the cores finish more while it works, but on an RX 6800 XT a batch
-/// costs at least 3.7 ms however small: 8,192 keys were slower overall, and 16,384 no faster.
+/// A discrete GPU has no dispatch near its watchdog, so a batch is one submit. On an
+/// RX 6800 XT a batch costs at least 3.7 ms however small: 8,192 keys were slower
+/// overall, and 16,384 no faster.
 pub const DISCRETE_TUNING: Tuning = Tuning { submit_every: 8, ..TUNING };
 
 /// What went wrong, for the log. Never holds key material.

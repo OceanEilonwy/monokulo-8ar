@@ -392,50 +392,43 @@ impl Keyring {
         Ok(Some(hits))
     }
 
-    /// Every account with every one of `jobs`' keys: the deriver works out a slab
-    /// while the cores finish the last.
+    /// Every account with every one of `jobs`' keys: the deriver works out a
+    /// slab, then the cores finish it, one after the other and never side by
+    /// side, as a scan runs on the GPU or the CPU and never both.
     fn on_grid(&self, jobs: &[Job], digits: &[&gpu::Digits], threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
         let keys: Vec<[u8; 32]> = jobs.iter().map(|job| sendable(&job.key)).collect();
         deriver.load(digits, &keys)?;
-        let items = (jobs.len() * digits.len()) as u64;
+        let result = self.slabs(jobs, digits.len(), threads, deriver);
+        deriver.unload();
+        result
+    }
+
+    /// The slabs of what's loaded, each finished on the cores before the next.
+    fn slabs(&self, jobs: &[Job], accounts: usize, threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
+        let items = (jobs.len() * accounts) as u64;
         let batch = deriver.batch() as u64;
         let found = Mutex::new(vec![]);
-        let result = std::thread::scope(|scope| {
-            // The GPU goes on to its next slab while the cores finish its last.
-            let (done, finishing) = std::sync::mpsc::sync_channel::<(u64, gpu::Points)>(1);
-            let found = &found;
-            scope.spawn(move || {
-                for (first, points) in finishing {
-                    in_ranges(points.len(), threads, CHUNK, |range| {
-                        let mut hits = vec![];
-                        for i in range {
-                            let item = first + i as u64;
-                            let (account, job) = ((item / jobs.len() as u64) as usize, &jobs[(item % jobs.len() as u64) as usize]);
-                            // Off the curve is the identity, as Monero treats it.
-                            let derivation = Zeroizing::new(points.get(i).unwrap_or(IDENTITY));
-                            if self.accounts[account].pays(&derivation, &job.outputs) {
-                                hits.push(Hit { account: AccountId(account as u32), block: job.block, tx: job.tx });
-                            }
-                        }
-                        if !hits.is_empty() {
-                            found.lock().expect("hits lock").extend(hits);
-                        }
-                    });
+        let mut first = 0;
+        while first < items {
+            let points = deriver.slab(first, batch.min(items - first) as usize)?;
+            in_ranges(points.len(), threads, CHUNK, |range| {
+                let mut hits = vec![];
+                for i in range {
+                    let item = first + i as u64;
+                    let (account, job) = ((item / jobs.len() as u64) as usize, &jobs[(item % jobs.len() as u64) as usize]);
+                    // Off the curve is the identity, as Monero treats it.
+                    let derivation = Zeroizing::new(points.get(i).unwrap_or(IDENTITY));
+                    if self.accounts[account].pays(&derivation, &job.outputs) {
+                        hits.push(Hit { account: AccountId(account as u32), block: job.block, tx: job.tx });
+                    }
+                }
+                if !hits.is_empty() {
+                    found.lock().expect("hits lock").extend(hits);
                 }
             });
-            let mut first = 0;
-            while first < items {
-                let points = deriver.slab(first, batch.min(items - first) as usize)?;
-                if done.send((first, points)).is_err() {
-                    // The finishing thread has gone only by panicking, which the scope passes on.
-                    break;
-                }
-                first += batch;
-            }
-            Ok(())
-        });
-        deriver.unload();
-        result.map(|()| found.into_inner().expect("hits lock"))
+            first += batch;
+        }
+        Ok(found.into_inner().expect("hits lock"))
     }
 }
 

@@ -43,9 +43,10 @@ speed and power, never of the answer.
   one. The GPU works through a grid of accounts by transaction keys that's
   never written out: each key is uploaded once, each account's digits are 64
   bytes, and a batch of 32,768 items is a slab of the grid, so GPU memory
-  doesn't grow with accounts. The cores do each item's view tags and spend
-  check, against that item's account's spend keys, while the GPU does the
-  next slab.
+  doesn't grow with accounts. Once the GPU has done a slab, the cores do each
+  item's view tags and spend check, against that item's account's spend keys:
+  one after the other, never side by side, as a scan runs on the GPU or the
+  CPU and never both.
 - `Arena`: one caller's share of the GPU. The process has one `gpu::Device`
   (instance, logical device, compute queues, pipelines and their cache, the
   self-test), and each arena its own buffers, command buffer and fence, about
