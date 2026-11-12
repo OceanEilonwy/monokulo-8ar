@@ -504,8 +504,19 @@ fn flags(hits: &[Hit], blocks: usize) -> Vec<bool> {
 }
 
 /// Adds the work `block` needs to `jobs`. False if it's beyond checking, for the
-/// `Scanner` to read whole.
+/// `Scanner` to read whole, and then none of its work is added: a newer fork,
+/// transactions missing, output indexes past u64::MAX, or a transaction whose
+/// keys this can't read as monero-oxide does.
 fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>) -> bool {
+    let before = jobs.len();
+    let judged = block_jobs(index, block, jobs);
+    if !judged {
+        jobs.truncate(before);
+    }
+    judged
+}
+
+fn block_jobs<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>) -> bool {
     if block.block.transactions.len() != block.transactions.len() || block.block.header.hardfork_version > NEWEST_FORK {
         return false;
     }
@@ -519,12 +530,19 @@ fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>)
     if ringct_outputs.is_none() {
         return false;
     }
-    let mut add = |tx: usize, version: u64, prefix: &'a TransactionPrefix| {
+    // False for a transaction it can't judge. The Scanner skips a v1
+    // transaction and one without a key, as this does.
+    let mut add = |tx: usize, version: u64, prefix: &'a TransactionPrefix| -> bool {
         if version != 2 {
-            return;
+            return true;
         }
-        let Ok(extra) = Extra::read(&mut prefix.extra.as_slice()) else { return };
-        let Some((keys, additional)) = encoded_keys(&extra) else { return };
+        // Reading an extra from bytes doesn't fail, but if it ever did, the
+        // Scanner would be the one to say what that means.
+        let Ok(extra) = Extra::read(&mut prefix.extra.as_slice()) else { return false };
+        let Some((keys, additional)) = encoded_keys(&extra) else {
+            // No key, unless monero-oxide finds one this didn't.
+            return extra.keys().is_none();
+        };
         for key in keys {
             jobs.push(Job { block: index, tx, key, outputs: Outputs::All(prefix) });
         }
@@ -533,13 +551,11 @@ fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>)
                 jobs.push(Job { block: index, tx, key, outputs: Outputs::One(prefix, o) });
             }
         }
+        true
     };
     let version = |tx_is_v2: bool| if tx_is_v2 { 2 } else { 1 };
-    add(0, version(matches!(miner, Transaction::V2 { .. })), miner.prefix());
-    for (i, tx) in block.transactions.iter().enumerate() {
-        add(i + 1, version(matches!(tx, Transaction::V2 { .. })), tx.prefix());
-    }
-    true
+    add(0, version(matches!(miner, Transaction::V2 { .. })), miner.prefix())
+        && block.transactions.iter().enumerate().all(|(i, tx)| add(i + 1, version(matches!(tx, Transaction::V2 { .. })), tx.prefix()))
 }
 
 #[cfg(test)]
