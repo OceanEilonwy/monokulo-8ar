@@ -216,14 +216,33 @@ fn wallet() -> (Wallet, Prefilter, Scanner) {
     (Wallet { view, spend, pair }, filter, scanner)
 }
 
+/// `n` as Monero's varint, written apart from the crate's own.
+fn push_varint(mut n: usize, out: &mut Vec<u8>) {
+    while n >= 0x80 {
+        out.push(n as u8 | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+#[test]
+fn varints_are_monero_s() {
+    for n in [0, 1, 127, 128, 300, 16_383, 16_384, u32::MAX as usize, usize::MAX] {
+        let (mut ours, mut theirs) = ([0; MOST_VARINT], vec![]);
+        let len = varint(n, &mut ours);
+        push_varint(n, &mut theirs);
+        assert_eq!(&ours[..len], theirs.as_slice(), "{n}");
+    }
+}
+
 /// An output of the transaction with key `r`, at `index`, paying `to`.
 fn paying(wallet: &Wallet, r: &Scalar, index: usize, to: EdwardsPoint) -> Output {
     let derivation = dalek_derivation(&wallet.view, &(r * ED25519_BASEPOINT_TABLE));
     let mut tagged = b"view_tag".to_vec();
     tagged.extend_from_slice(&derivation);
-    varint(index, &mut tagged);
+    push_varint(index, &mut tagged);
     let mut shared = derivation.to_vec();
-    varint(index, &mut shared);
+    push_varint(index, &mut shared);
     let shared = Scalar::from_bytes_mod_order(Keccak256::digest(&shared).into());
     let key = &shared * ED25519_BASEPOINT_TABLE + to;
     Output { amount: Some(1_000), key: CompressedPoint::from(key.compress().to_bytes()), view_tag: Some(Keccak256::digest(&tagged)[0]) }

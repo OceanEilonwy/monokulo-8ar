@@ -147,12 +147,20 @@ fn sendable(key: &[u8; 32]) -> [u8; 32] {
     if canonical(key) { *key } else { CompressedPoint::IDENTITY.to_bytes() }
 }
 
-fn varint(mut n: usize, out: &mut Vec<u8>) {
+/// The longest a usize takes as a varint.
+const MOST_VARINT: usize = usize::BITS.div_ceil(7) as usize;
+
+/// Writes `n` as a varint at the start of `out`, which has room for
+/// [`MOST_VARINT`] bytes, and says how many bytes it took.
+fn varint(mut n: usize, out: &mut [u8]) -> usize {
+    let mut at = 0;
     while n >= 0x80 {
-        out.push(n as u8 | 0x80);
+        out[at] = n as u8 | 0x80;
         n >>= 7;
+        at += 1;
     }
-    out.push(n as u8);
+    out[at] = n as u8;
+    at + 1
 }
 
 /// Runs `each` over `items` on `threads` threads, a chunk at a time.
@@ -229,27 +237,26 @@ impl Account {
             Outputs::All(prefix) => (*prefix, 0..prefix.outputs.len()),
             Outputs::One(prefix, o) => (*prefix, *o..*o + 1),
         };
-        let mut message = Zeroizing::new(Vec::with_capacity(48));
+        // "view_tag", the derivation and the output's index: on the stack, as
+        // this runs for every item, and wiped after.
+        let mut message = Zeroizing::new([0u8; 8 + 32 + MOST_VARINT]);
+        message[..8].copy_from_slice(b"view_tag");
+        message[8..40].copy_from_slice(derivation);
         for o in range {
             let Some(output) = prefix.outputs.get(o) else { continue };
             if output.key == CompressedPoint::IDENTITY {
                 continue;
             }
-            if let Some(tag) = output.view_tag {
-                message.clear();
-                message.extend_from_slice(b"view_tag");
-                message.extend_from_slice(derivation);
-                varint(o, &mut message);
-                if Keccak256::digest(&*message)[0] != tag {
-                    continue;
-                }
+            let end = 40 + varint(o, &mut message[40..]);
+            if let Some(tag) = output.view_tag
+                && Keccak256::digest(&message[..end])[0] != tag
+            {
+                continue;
             }
             let Some(key) = output.key.decompress() else { continue };
             let key: EdwardsPoint = key.into();
-            message.clear();
-            message.extend_from_slice(derivation);
-            varint(o, &mut message);
-            let shared = Zeroizing::new(Scalar::from_bytes_mod_order(Keccak256::digest(&*message).into()));
+            let hash = Zeroizing::new(<[u8; 32]>::from(Keccak256::digest(&message[8..end])));
+            let shared = Zeroizing::new(Scalar::from_bytes_mod_order(*hash));
             let spend = key - (&*shared * ED25519_BASEPOINT_TABLE);
             if self.spends.contains(spend.compress().as_bytes()) {
                 return true;
