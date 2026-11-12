@@ -264,6 +264,8 @@ impl Account {
 trait Deriver {
     /// The most items a slab takes.
     fn batch(&self) -> usize;
+    /// The most keys and the most accounts a load takes.
+    fn most(&self) -> (usize, usize);
     fn load(&mut self, accounts: &[&gpu::Digits], keys: &[[u8; 32]]) -> Result<(), GpuError>;
     fn slab(&mut self, first_item: u64, count: usize) -> Result<gpu::Points, GpuError>;
     fn unload(&mut self);
@@ -274,6 +276,10 @@ struct OnGpu<'a>(&'a gpu::Arena);
 impl Deriver for OnGpu<'_> {
     fn batch(&self) -> usize {
         self.0.tuning().batch
+    }
+
+    fn most(&self) -> (usize, usize) {
+        (self.0.most_keys(), self.0.most_accounts())
     }
 
     fn load(&mut self, accounts: &[&gpu::Digits], keys: &[[u8; 32]]) -> Result<(), GpuError> {
@@ -380,11 +386,14 @@ impl Keyring {
         }
         let accounts = self.accounts.len();
         let mut hits: Vec<Hit> = whole.iter().flat_map(|&block| (0..accounts).map(move |a| Hit { account: AccountId(a as u32), block, tx: Hit::WHOLE_BLOCK })).collect();
-        if accounts > 0 && !jobs.is_empty() {
-            let digits: Vec<&gpu::Digits> = self.accounts.iter().map(|a| &a.digits).collect();
-            let per_load = (MOST_ITEMS / accounts as u64).max(1) as usize;
+        // As many loads as the GPU needs: each within its buffers' bounds, and
+        // the grid's items countable in 32 bits.
+        let (most_keys, most_accounts) = deriver.most();
+        for first_account in (0..accounts).step_by(most_accounts.max(1)) {
+            let these = first_account..accounts.min(first_account + most_accounts.max(1));
+            let per_load = (MOST_ITEMS / these.len() as u64).max(1).min(most_keys.max(1) as u64) as usize;
             for part in jobs.chunks(per_load) {
-                hits.extend(self.on_grid(part, &digits, threads, deriver)?);
+                hits.extend(self.on_grid(part, these.clone(), threads, deriver)?);
             }
         }
         hits.sort_unstable();
@@ -395,10 +404,11 @@ impl Keyring {
     /// Every account with every one of `jobs`' keys: the deriver works out a
     /// slab, then the cores finish it, one after the other and never side by
     /// side, as a scan runs on the GPU or the CPU and never both.
-    fn on_grid(&self, jobs: &[Job], digits: &[&gpu::Digits], threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
+    fn on_grid(&self, jobs: &[Job], accounts: Range<usize>, threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
         let keys: Vec<[u8; 32]> = jobs.iter().map(|job| sendable(&job.key)).collect();
-        deriver.load(digits, &keys)?;
-        let result = self.slabs(jobs, &keys, digits.len(), threads, deriver);
+        let digits: Vec<&gpu::Digits> = self.accounts[accounts.clone()].iter().map(|a| &a.digits).collect();
+        deriver.load(&digits, &keys)?;
+        let result = self.slabs(jobs, &keys, accounts, threads, deriver);
         deriver.unload();
         result
     }
@@ -409,8 +419,8 @@ impl Keyring {
     /// the GPU's own check or the CPU's, or a key said to be off the curve that
     /// isn't. Each answer stands alone, so one bad point says nothing of the
     /// others, but nothing from a faulty GPU is trusted.
-    fn slabs(&self, jobs: &[Job], keys: &[[u8; 32]], accounts: usize, threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
-        let items = (jobs.len() * accounts) as u64;
+    fn slabs(&self, jobs: &[Job], keys: &[[u8; 32]], accounts: Range<usize>, threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
+        let items = (jobs.len() * accounts.len()) as u64;
         let batch = deriver.batch() as u64;
         let found = Mutex::new(vec![]);
         let wrong = AtomicBool::new(false);
@@ -424,7 +434,7 @@ impl Keyring {
                 let mut hits = vec![];
                 for i in range {
                     let item = first + i as u64;
-                    let (account, key) = ((item / jobs.len() as u64) as usize, (item % jobs.len() as u64) as usize);
+                    let (account, key) = (accounts.start + (item / jobs.len() as u64) as usize, (item % jobs.len() as u64) as usize);
                     let derivation = match points.derived(i) {
                         Derived::Point(point) => Zeroizing::new(point),
                         // Off the curve is the identity, as Monero treats it.

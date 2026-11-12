@@ -81,6 +81,11 @@ const PUSH_BYTES: u32 = 20;
 const MOST_QUEUES: u32 = 4;
 /// Storage buffers: keys, state, results, account digits.
 const BINDINGS: u32 = 4;
+/// The most keys one load takes, 32 MB of them, however many more a GPU's
+/// buffers could hold: the caller splits a bigger load.
+const MOST_KEYS: usize = 1 << 20;
+/// The most accounts one load takes: 64 MB of digits.
+const MOST_ACCOUNTS: usize = 1 << 20;
 
 /// How the work is cut up.
 #[derive(Clone, Copy, Debug)]
@@ -220,6 +225,8 @@ pub struct Device {
     last: vk::Pipeline,
     check: vk::Pipeline,
     tuning: Tuning,
+    /// The most bytes a storage buffer's binding may span.
+    range: u64,
     name: String,
     driver: u32,
 }
@@ -290,6 +297,7 @@ impl Device {
             };
             let properties = instance.get_physical_device_properties(physical);
             let driver = properties.driver_version;
+            let range = u64::from(properties.limits.max_storage_buffer_range);
             let tuning = tuning.unwrap_or(match properties.device_type {
                 vk::PhysicalDeviceType::DISCRETE_GPU => DISCRETE_TUNING,
                 _ => TUNING,
@@ -327,6 +335,7 @@ impl Device {
                 last: vk::Pipeline::null(),
                 check: vk::Pipeline::null(),
                 tuning,
+                range,
                 name,
                 driver,
             };
@@ -569,6 +578,17 @@ impl Arena {
         self.gpu.tuning
     }
 
+    /// The most keys one [`load`](Arena::load) takes: what a buffer binding can
+    /// span, and at most a million.
+    pub fn most_keys(&self) -> usize {
+        usize::try_from(self.gpu.range / 32).unwrap_or(usize::MAX).min(MOST_KEYS)
+    }
+
+    /// The most accounts one [`load`](Arena::load) takes, in the same way.
+    pub fn most_accounts(&self) -> usize {
+        usize::try_from(self.gpu.range / ACCOUNT_BYTES as u64).unwrap_or(usize::MAX).min(MOST_ACCOUNTS)
+    }
+
     /// A buffer in the first memory type with all of one of `wanted`'s flags.
     unsafe fn buffer(&self, size: u64, wanted: &[vk::MemoryPropertyFlags]) -> Result<Buffer, GpuError> {
         unsafe {
@@ -791,14 +811,16 @@ impl Arena {
         result
     }
 
-    /// Puts `keys` (canonical; fewer than 2^31 items in all) and the accounts'
-    /// digits on the GPU, for [`slab`](Arena::slab) to take items of the grid
-    /// from: item `g` is key `g % keys.len()` with account `g / keys.len()`.
-    /// [`unload`](Arena::unload) wipes the digits again.
+    /// Puts `keys` (canonical; fewer than 2^31 items in all, at most
+    /// [`most_keys`](Arena::most_keys) keys and [`most_accounts`](Arena::most_accounts)
+    /// accounts) and the accounts' digits on the GPU, for [`slab`](Arena::slab)
+    /// to take items of the grid from: item `g` is key `g % keys.len()` with
+    /// account `g / keys.len()`. [`unload`](Arena::unload) wipes the digits again.
     pub fn load(&self, accounts: &[&Digits], keys: &[[u8; 32]]) -> Result<(), GpuError> {
         let items = keys.len() as u64 * accounts.len() as u64;
-        if items >= 1 << 31 {
-            return Err(GpuError::failed(format!("{items} items in one load")));
+        // A binding past the GPU's range is undefined, and the shader indexes keys in 32 bits.
+        if items >= 1 << 31 || keys.len() > self.most_keys() || accounts.len() > self.most_accounts() {
+            return Err(GpuError::failed(format!("{} keys and {} accounts in one load", keys.len(), accounts.len())));
         }
         let result = unsafe {
             let batch = (items as usize).min(self.gpu.tuning.batch).max(1) as u32;
@@ -868,8 +890,16 @@ impl Arena {
     }
 
     /// One field operation on each pair: for the tests. 0 adds, 1 subtracts,
-    /// 2 multiplies, 3 squares, 4 negates and 5 only reduces.
+    /// 2 multiplies, 3 squares, 4 negates and 5 only reduces. At most
+    /// [`Tuning::batch`] pairs.
     pub fn check_field(&self, op: u32, pairs: &[([u32; 8], [u32; 8])]) -> Result<Vec<[u32; 8]>, GpuError> {
+        if pairs.is_empty() {
+            // Nothing to dispatch, and clearing no bytes of state isn't allowed.
+            return Ok(vec![]);
+        }
+        if pairs.len() > self.gpu.tuning.batch {
+            return Err(GpuError::failed(format!("{} pairs at once", pairs.len())));
+        }
         let mut input = Vec::with_capacity(pairs.len() * 64);
         for (a, b) in pairs {
             for limb in a.iter().chain(b) {

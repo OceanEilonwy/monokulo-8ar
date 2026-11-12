@@ -51,17 +51,30 @@ fn dalek_points(view: &Scalar, keys: &[[u8; 32]]) -> gpu::Points {
 /// curve25519-dalek in the GPU's place, for a keyring whose accounts' view keys
 /// are `views`, in slabs of `batch` items.
 struct OnDalek {
+    /// Every account's view key, of which a load takes some.
     views: Vec<Scalar>,
+    loaded: Vec<Scalar>,
     keys: Vec<[u8; 32]>,
     batch: usize,
+    /// The most keys and accounts a load takes.
+    most: (usize, usize),
     /// An item whose words a faulty GPU gets wrong, and what it hands back.
     fault: Option<(u64, [u32; 9])>,
 }
 
 impl OnDalek {
     fn new(views: &[Scalar], batch: usize) -> OnDalek {
-        OnDalek { views: views.to_vec(), keys: vec![], batch, fault: None }
+        OnDalek { views: views.to_vec(), loaded: vec![], keys: vec![], batch, most: (usize::MAX, usize::MAX), fault: None }
     }
+}
+
+/// The scalar `digits` are of.
+fn scalar_of(digits: &gpu::Digits) -> Scalar {
+    (0..64).rev().fold(Scalar::ZERO, |acc, i| {
+        let digit = digits.get(i);
+        let size = Scalar::from(digit.unsigned_abs());
+        acc * Scalar::from(16u8) + if digit < 0 { -size } else { size }
+    })
 }
 
 impl Deriver for OnDalek {
@@ -69,8 +82,14 @@ impl Deriver for OnDalek {
         self.batch
     }
 
+    fn most(&self) -> (usize, usize) {
+        self.most
+    }
+
     fn load(&mut self, accounts: &[&gpu::Digits], keys: &[[u8; 32]]) -> Result<(), GpuError> {
-        assert_eq!(accounts.len(), self.views.len(), "a view key for each account");
+        assert!(keys.len() <= self.most.0 && accounts.len() <= self.most.1, "within the load's bounds");
+        self.loaded = accounts.iter().map(|digits| scalar_of(digits)).collect();
+        assert!(self.loaded.iter().all(|view| self.views.contains(view)), "each account's own view key");
         self.keys = keys.to_vec();
         Ok(())
     }
@@ -81,7 +100,7 @@ impl Deriver for OnDalek {
         for item in first_item as usize..first_item as usize + count {
             match self.fault {
                 Some((at, wrong)) if at == item as u64 => words.extend(wrong),
-                _ => dalek_words(&self.views[item / self.keys.len()], &self.keys[item % self.keys.len()], &mut words),
+                _ => dalek_words(&self.loaded[item / self.keys.len()], &self.keys[item % self.keys.len()], &mut words),
             }
         }
         Ok(gpu::Points::from_words(words))
@@ -458,6 +477,30 @@ fn copies_flag_what_one_flags(hits_of: impl Fn(&Keyring, &[Scalar], &[ScannableB
 #[test]
 fn a_keyring_of_copies_flags_what_one_key_flags() {
     copies_flag_what_one_flags(|keyring, views, blocks| dalek_hits(keyring, views, blocks, 4, 1000));
+}
+
+/// A load the GPU can't take whole is split, by keys and by accounts, and
+/// finds the same.
+#[test]
+fn loads_too_big_for_the_gpu_are_split() {
+    let (w, _, _) = wallet();
+    let blocks = keyring_blocks(&w);
+    let mut rng = StdRng::seed_from_u64(13);
+    let mut keyring = copies(&w, 1);
+    let mut views = vec![w.view];
+    for _ in 0..4 {
+        let view = random_scalar(&mut rng);
+        let spend = &random_scalar(&mut rng) * ED25519_BASEPOINT_TABLE;
+        let pair = ViewPair::new(Point::from(spend), Zeroizing::new(MoneroScalar::read(&mut view.to_bytes().as_slice()).unwrap())).unwrap();
+        keyring.add(&pair, &Zeroizing::new(view.to_bytes()));
+        views.push(view);
+    }
+    let whole = dalek_hits(&keyring, &views, &blocks, 4, 1000);
+    for most in [(1, 1), (7, 2), (100, 3), (1000, 5)] {
+        let mut split = OnDalek::new(&views, 64);
+        split.most = most;
+        assert_eq!(keyring.flag_by(&blocks, 4, 0, &mut split).unwrap().unwrap(), whole, "{most:?}");
+    }
 }
 
 /// Accounts that aren't paid see only the block they must read whole, and the
