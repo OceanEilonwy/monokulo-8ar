@@ -10,7 +10,7 @@ and decompresses every output key. This crate has a GPU (Vulkan, through
 dispatch, compressed on the GPU, and only decompresses an output key past a
 matching view tag.
 
-It decides nothing about money. A block it flags goes whole to the
+It decides nothing about money. A block it flags goes to the
 unmodified `Scanner`, which alone finds the outputs, their amounts and their
 subaddresses. Its one duty is never to miss, and anything it doesn't
 understand (a newer fork, missing transactions) is flagged. Its reading of
@@ -31,6 +31,11 @@ speed and power, never of the answer.
   `ScannableBlock`s and says which may pay it, or `None` if it didn't filter
   them: the GPU isn't ready or was retired, or the batch holds fewer than the
   caller's `min_keys` transaction keys. Then the caller scans every block.
+  `Prefilter::flag_txs` says the same per transaction: for each block,
+  `Txs::Clear`, `Txs::These` (0 the miner transaction, 1 on
+  `block.transactions[tx - 1]`), or `Txs::All` for a block it can't vouch
+  for (a newer fork, transactions missing, keys it can't read), so a caller
+  can hand the `Scanner` only the transactions that may pay.
   `warm_up`, `check_wallet`, `rest` and `set_cache_dir` manage the one GPU a
   process has, and `engine()` says what's doing the work (the GPU and its
   name, or the CPU and why), for a setting to show. The compiled pipeline is

@@ -5,9 +5,12 @@
 //! of a scan's cost: 8aR for each transaction key, a view tag for each output.
 //! [`Prefilter`] does exactly that, faster than monero-oxide's `Scanner`, which
 //! works out 8aR once per output rather than once per key. It decides nothing
-//! about money: a block it flags goes to the `Scanner`, whole, which alone finds
-//! the outputs, their amounts and their subaddresses. So its one duty is never
-//! to miss, and anything it doesn't understand is flagged.
+//! about money: a block it flags goes to the `Scanner`, which alone finds the
+//! outputs, their amounts and their subaddresses. So its one duty is never to
+//! miss, and anything it doesn't understand is flagged.
+//! [`Prefilter::flag_txs`] also says which transactions in a block may pay, for
+//! a caller to hand the `Scanner` only those; a block it can't vouch for is
+//! [`Txs::All`].
 //!
 //! The arithmetic runs on the GPU, in Vulkan, and only there: a GPU passes test
 //! vectors once per process before it's used, and again with each wallet's view
@@ -492,6 +495,43 @@ impl Prefilter {
     pub fn flag(&self, blocks: &[ScannableBlock], threads: usize, min_keys: usize) -> Option<Vec<bool>> {
         self.0.flag_many(blocks, threads, min_keys).map(|hits| flags(&hits, blocks.len()))
     }
+
+    /// Which transactions in each of `blocks` could hold money for this
+    /// wallet, or `None` if it didn't filter them, as [`Keyring::flag_many`]
+    /// says. A block is flagged exactly when [`flag`](Prefilter::flag) flags it.
+    pub fn flag_txs(&self, blocks: &[ScannableBlock], threads: usize, min_keys: usize) -> Option<Vec<Txs>> {
+        self.0.flag_many(blocks, threads, min_keys).map(|hits| txs(&hits, blocks.len()))
+    }
+}
+
+/// Which of a block's transactions may pay a wallet, as [`Prefilter::flag_txs`] says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Txs {
+    /// None: the `Scanner` needn't read the block.
+    Clear,
+    /// These, ascending, as a [`Hit`]'s `tx`: 0 the miner transaction, 1 on
+    /// `block.transactions[tx - 1]`. Every other transaction has no output the
+    /// `Scanner` could find.
+    These(Vec<usize>),
+    /// Every one: the prefilter can't vouch for the block (a newer fork,
+    /// transactions missing, keys it can't read), and the `Scanner` reads it whole.
+    All,
+}
+
+impl Txs {
+    /// Whether the `Scanner` reads the block.
+    pub fn flagged(&self) -> bool {
+        !matches!(self, Txs::Clear)
+    }
+
+    /// Whether the `Scanner` reads the transaction at `tx`, numbered as in [`Txs::These`].
+    pub fn has(&self, tx: usize) -> bool {
+        match self {
+            Txs::Clear => false,
+            Txs::These(txs) => txs.binary_search(&tx).is_ok(),
+            Txs::All => true,
+        }
+    }
 }
 
 /// One bool a block: whether any hit is in it.
@@ -503,9 +543,41 @@ fn flags(hits: &[Hit], blocks: usize) -> Vec<bool> {
     flags
 }
 
+/// One [`Txs`] a block, from one account's hits.
+fn txs(hits: &[Hit], blocks: usize) -> Vec<Txs> {
+    let mut txs = vec![Txs::Clear; blocks];
+    for hit in hits {
+        let block = &mut txs[hit.block];
+        match (hit.tx, &mut *block) {
+            (_, Txs::All) => {}
+            (Hit::WHOLE_BLOCK, _) => *block = Txs::All,
+            (tx, Txs::These(list)) => list.push(tx),
+            (tx, Txs::Clear) => *block = Txs::These(vec![tx]),
+        }
+    }
+    for block in &mut txs {
+        if let Txs::These(list) = block {
+            list.sort_unstable();
+            list.dedup();
+        }
+    }
+    txs
+}
+
 /// Adds the work `block` needs to `jobs`. False if it's beyond checking, for the
-/// `Scanner` to read whole.
+/// `Scanner` to read whole, and then none of its work is added: a newer fork,
+/// transactions missing, output indexes past u64::MAX, or a transaction whose
+/// keys this can't read as monero-oxide does.
 fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>) -> bool {
+    let before = jobs.len();
+    let judged = block_jobs(index, block, jobs);
+    if !judged {
+        jobs.truncate(before);
+    }
+    judged
+}
+
+fn block_jobs<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>) -> bool {
     if block.block.transactions.len() != block.transactions.len() || block.block.header.hardfork_version > NEWEST_FORK {
         return false;
     }
@@ -519,12 +591,19 @@ fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>)
     if ringct_outputs.is_none() {
         return false;
     }
-    let mut add = |tx: usize, version: u64, prefix: &'a TransactionPrefix| {
+    // False for a transaction it can't judge. The Scanner skips a v1
+    // transaction and one without a key, as this does.
+    let mut add = |tx: usize, version: u64, prefix: &'a TransactionPrefix| -> bool {
         if version != 2 {
-            return;
+            return true;
         }
-        let Ok(extra) = Extra::read(&mut prefix.extra.as_slice()) else { return };
-        let Some((keys, additional)) = encoded_keys(&extra) else { return };
+        // Reading an extra from bytes doesn't fail, but if it ever did, the
+        // Scanner would be the one to say what that means.
+        let Ok(extra) = Extra::read(&mut prefix.extra.as_slice()) else { return false };
+        let Some((keys, additional)) = encoded_keys(&extra) else {
+            // No key, unless monero-oxide finds one this didn't.
+            return extra.keys().is_none();
+        };
         for key in keys {
             jobs.push(Job { block: index, tx, key, outputs: Outputs::All(prefix) });
         }
@@ -533,13 +612,11 @@ fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>)
                 jobs.push(Job { block: index, tx, key, outputs: Outputs::One(prefix, o) });
             }
         }
+        true
     };
     let version = |tx_is_v2: bool| if tx_is_v2 { 2 } else { 1 };
-    add(0, version(matches!(miner, Transaction::V2 { .. })), miner.prefix());
-    for (i, tx) in block.transactions.iter().enumerate() {
-        add(i + 1, version(matches!(tx, Transaction::V2 { .. })), tx.prefix());
-    }
-    true
+    add(0, version(matches!(miner, Transaction::V2 { .. })), miner.prefix())
+        && block.transactions.iter().enumerate().all(|(i, tx)| add(i + 1, version(matches!(tx, Transaction::V2 { .. })), tx.prefix()))
 }
 
 #[cfg(test)]
