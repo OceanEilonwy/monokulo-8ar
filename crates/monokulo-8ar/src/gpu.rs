@@ -50,7 +50,9 @@ impl Digits {
 
     pub fn new(scalar: &[u8; 32]) -> Digits {
         assert!(scalar[31] <= 127);
-        let mut d = [0i8; 64];
+        // Worked out where they're kept, which is wiped on drop, not in a copy.
+        let mut digits = Digits([0; 64]);
+        let d = &mut digits.0;
         for i in 0..32 {
             d[2 * i] = (scalar[i] & 15) as i8;
             d[2 * i + 1] = ((scalar[i] >> 4) & 15) as i8;
@@ -60,7 +62,7 @@ impl Digits {
             d[i] -= c << 4;
             d[i + 1] += c;
         }
-        Digits(d)
+        digits
     }
 }
 
