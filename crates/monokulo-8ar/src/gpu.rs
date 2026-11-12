@@ -753,6 +753,8 @@ impl Arena {
                 if let Ok(queue) = self.gpu.queues[self.queue].lock() {
                     let _ = device.queue_wait_idle(*queue);
                 }
+                // A fence still signalled can't go with the next submit.
+                let _ = device.reset_fences(&[self.fence]);
                 return Err(failed("waiting")(e));
             }
             device.reset_fences(&[self.fence]).map_err(failed("fence"))?;
