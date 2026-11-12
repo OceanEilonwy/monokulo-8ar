@@ -403,6 +403,12 @@ fn every_way_of_being_paid(flag: Flagger) {
     let mut mismatched = block_of(vec![stranger(&mut rng)], extra_of(&[key], None));
     mismatched.block = Block::new(mismatched.block.header.clone(), mismatched.block.miner_transaction().clone(), vec![[1; 32]]).unwrap();
     agree("transactions missing", flag, &w, &filter, &scanner, mismatched, true);
+    let mut past_the_last_index = block_of(vec![stranger(&mut rng)], extra_of(&[key], None));
+    past_the_last_index.output_index_for_first_ringct_output = Some(u64::MAX);
+    agree("output indexes past u64::MAX", flag, &w, &filter, &scanner, past_the_last_index, true);
+    let mut at_the_last_index = block_of(vec![stranger(&mut rng)], extra_of(&[key], None));
+    at_the_last_index.output_index_for_first_ringct_output = Some(u64::MAX - 1);
+    agree("output indexes up to u64::MAX", flag, &w, &filter, &scanner, at_the_last_index, false);
 }
 
 #[test]

@@ -509,10 +509,16 @@ fn jobs_of<'a>(index: usize, block: &'a ScannableBlock, jobs: &mut Vec<Job<'a>>)
     if block.block.transactions.len() != block.transactions.len() || block.block.header.hardfork_version > NEWEST_FORK {
         return false;
     }
-    if block.output_index_for_first_ringct_output.is_none() {
-        return true;
-    }
+    let Some(first_ringct_output) = block.output_index_for_first_ringct_output else { return true };
     let miner = block.block.miner_transaction();
+    // The Scanner refuses a block whose RingCT outputs' indexes pass u64::MAX.
+    let ringct_outputs = std::iter::once(miner.prefix())
+        .filter(|_| matches!(miner, Transaction::V2 { .. }))
+        .chain(block.transactions.iter().filter(|tx| matches!(tx, Transaction::V2 { .. })).map(Transaction::prefix))
+        .try_fold(first_ringct_output, |at, prefix| at.checked_add(prefix.outputs.len() as u64));
+    if ringct_outputs.is_none() {
+        return false;
+    }
     let mut add = |tx: usize, version: u64, prefix: &'a TransactionPrefix| {
         if version != 2 {
             return;
