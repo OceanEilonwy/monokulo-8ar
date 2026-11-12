@@ -2,8 +2,9 @@
 //!
 //! The GPU does the curve arithmetic, inverts each point's Z and hands back the
 //! compressed points; the CPU does everything after. A key that isn't on the
-//! curve comes back marked. Any Vulkan failure is an error for the caller, which
-//! then scans without the prefilter. Nothing here panics: a driver's behaviour
+//! curve comes back marked, and so does a point the GPU's own check finds off
+//! it, which only a fault makes. Any Vulkan failure is an error for the caller,
+//! which then scans without the prefilter. Nothing here panics: a driver's behaviour
 //! is outside what the wallet can vouch for.
 //!
 //! A [`Device`] is the GPU, set up once a process: the instance, the logical
@@ -66,7 +67,8 @@ impl Digits {
 const SPIRV: &[u8] = include_bytes!("../shaders/scan.spv");
 /// A work item's state on the GPU: 300 words.
 const STATE_BYTES: u64 = 300 * 4;
-/// A work item's result: the compressed point, then whether the key was off the curve.
+/// A work item's result: the compressed point, then a flag: 1 if the key was off
+/// the curve, 2 if the point failed the GPU's own check.
 const OUT_WORDS: usize = 9;
 /// An account's digits on the GPU: 64 signed bytes.
 const ACCOUNT_BYTES: usize = 64;
@@ -133,6 +135,16 @@ fn failed(what: &str) -> impl Fn(vk::Result) -> GpuError + '_ {
     move |e| GpuError::failed(format!("{what}: {e}"))
 }
 
+/// One item of [`Points`].
+pub enum Derived {
+    /// 8aR, compressed. Wipe it when done.
+    Point([u8; 32]),
+    /// The key wasn't on the curve, the GPU says: Monero takes it as the identity.
+    OffCurve,
+    /// Not an answer the GPU could have got right: it's faulty.
+    Wrong,
+}
+
 /// What the GPU worked out for a batch of items. Copied out whole first, as
 /// reading the GPU's memory a word at a time is slow on a phone, and decoded by
 /// whichever thread takes each point.
@@ -144,17 +156,39 @@ impl Points {
         Points(Zeroizing::new(words))
     }
 
-    /// Item `i`'s point, compressed, or `None` if its key wasn't on the curve.
-    /// Wipe it when done: it's the key's shared secret with the wallet.
+    /// Item `i`'s point, compressed, or `None` if its key wasn't on the curve or
+    /// the GPU says it went wrong. Wipe it when done: it's the key's shared
+    /// secret with the wallet.
     pub fn get(&self, i: usize) -> Option<[u8; 32]> {
+        match self.derived(i) {
+            Derived::Point(bytes) => Some(bytes),
+            Derived::OffCurve | Derived::Wrong => None,
+        }
+    }
+
+    /// Item `i` as the GPU handed it back, with what the CPU can check cheaply
+    /// held against it: a flag it knows, and a point that's a canonical encoding
+    /// and not y = 0. That point has order 4, which 8aR never has; it's what a
+    /// zero Z comes out as.
+    pub fn derived(&self, i: usize) -> Derived {
         let word = &self.0[i * OUT_WORDS..(i + 1) * OUT_WORDS];
-        (word[8] == 0).then(|| {
-            let mut bytes = [0; 32];
-            for (limb, out) in word[..8].iter().zip(bytes.as_chunks_mut::<4>().0) {
-                *out = limb.to_le_bytes();
+        match word[8] {
+            0 => {
+                let mut bytes = [0; 32];
+                for (limb, out) in word[..8].iter().zip(bytes.as_chunks_mut::<4>().0) {
+                    *out = limb.to_le_bytes();
+                }
+                let y_is_zero = bytes[..31].iter().all(|b| *b == 0) && bytes[31] & 0x7f == 0;
+                if crate::canonical(&bytes) && !y_is_zero {
+                    Derived::Point(bytes)
+                } else {
+                    bytes.zeroize();
+                    Derived::Wrong
+                }
             }
-            bytes
-        })
+            1 => Derived::OffCurve,
+            _ => Derived::Wrong,
+        }
     }
 
     pub fn len(&self) -> usize {

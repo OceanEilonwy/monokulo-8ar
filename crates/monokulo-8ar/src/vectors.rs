@@ -304,10 +304,12 @@ mod tests {
                 wrong[i * 9 + word] ^= 1 << bit;
                 assert!(!agrees(&case, &Points::from_words(wrong)), "a changed point");
             }
-            // A key's flag the wrong way round.
-            let mut wrong = words.clone();
-            wrong[i * 9 + 8] = 1;
-            assert!(!agrees(&case, &Points::from_words(wrong)), "a refused key");
+            // A key's flag the wrong way round, or the GPU's own check failing.
+            for flag in [1, 2] {
+                let mut wrong = words.clone();
+                wrong[i * 9 + 8] = flag;
+                assert!(!agrees(&case, &Points::from_words(wrong)), "flag {flag}");
+            }
             // Too few answers.
             assert!(!agrees(&case, &Points::from_words(words[..words.len() - 9].to_vec())));
         }

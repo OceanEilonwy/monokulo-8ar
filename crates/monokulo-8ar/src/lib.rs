@@ -35,14 +35,14 @@ use std::{
     collections::HashSet,
     ops::Range,
     sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
-use gpu::GpuError;
+use gpu::{Derived, GpuError};
 
-use curve25519_dalek::{EdwardsPoint, Scalar, constants::ED25519_BASEPOINT_TABLE};
+use curve25519_dalek::{EdwardsPoint, Scalar, constants::ED25519_BASEPOINT_TABLE, edwards::CompressedEdwardsY};
 use monero_wallet::{
     ViewPair,
     address::{Network, SubaddressIndex},
@@ -398,16 +398,25 @@ impl Keyring {
     fn on_grid(&self, jobs: &[Job], digits: &[&gpu::Digits], threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
         let keys: Vec<[u8; 32]> = jobs.iter().map(|job| sendable(&job.key)).collect();
         deriver.load(digits, &keys)?;
-        let result = self.slabs(jobs, digits.len(), threads, deriver);
+        let result = self.slabs(jobs, &keys, digits.len(), threads, deriver);
         deriver.unload();
         result
     }
 
     /// The slabs of what's loaded, each finished on the cores before the next.
-    fn slabs(&self, jobs: &[Job], accounts: usize, threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
+    /// An answer the GPU can't have got right is an error, which retires it, and
+    /// the caller then scans every block with the `Scanner`: a point that fails
+    /// the GPU's own check or the CPU's, or a key said to be off the curve that
+    /// isn't. Each answer stands alone, so one bad point says nothing of the
+    /// others, but nothing from a faulty GPU is trusted.
+    fn slabs(&self, jobs: &[Job], keys: &[[u8; 32]], accounts: usize, threads: usize, deriver: &mut impl Deriver) -> Result<Vec<Hit>, GpuError> {
         let items = (jobs.len() * accounts) as u64;
         let batch = deriver.batch() as u64;
         let found = Mutex::new(vec![]);
+        let wrong = AtomicBool::new(false);
+        // Whether each key is off the curve, as curve25519-dalek finds when the GPU
+        // says one is, which is rare: once a key, not once an account.
+        let off_curve: Vec<OnceLock<bool>> = keys.iter().map(|_| OnceLock::new()).collect();
         let mut first = 0;
         while first < items {
             let points = deriver.slab(first, batch.min(items - first) as usize)?;
@@ -415,9 +424,17 @@ impl Keyring {
                 let mut hits = vec![];
                 for i in range {
                     let item = first + i as u64;
-                    let (account, job) = ((item / jobs.len() as u64) as usize, &jobs[(item % jobs.len() as u64) as usize]);
-                    // Off the curve is the identity, as Monero treats it.
-                    let derivation = Zeroizing::new(points.get(i).unwrap_or(IDENTITY));
+                    let (account, key) = ((item / jobs.len() as u64) as usize, (item % jobs.len() as u64) as usize);
+                    let derivation = match points.derived(i) {
+                        Derived::Point(point) => Zeroizing::new(point),
+                        // Off the curve is the identity, as Monero treats it.
+                        Derived::OffCurve if *off_curve[key].get_or_init(|| CompressedEdwardsY(keys[key]).decompress().is_none()) => Zeroizing::new(IDENTITY),
+                        Derived::OffCurve | Derived::Wrong => {
+                            wrong.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    };
+                    let job = &jobs[key];
                     if self.accounts[account].pays(&derivation, &job.outputs) {
                         hits.push(Hit { account: AccountId(account as u32), block: job.block, tx: job.tx });
                     }
@@ -426,6 +443,9 @@ impl Keyring {
                     found.lock().expect("hits lock").extend(hits);
                 }
             });
+            if wrong.load(Ordering::Relaxed) {
+                return Err(GpuError { what: "a point the GPU got wrong".into(), kind: gpu::GpuErrorKind::Failed });
+            }
             first += batch;
         }
         Ok(found.into_inner().expect("hits lock"))

@@ -21,7 +21,8 @@ arithmetic: without a GPU, the caller scans every block with the `Scanner`,
 which is slower but needs nothing from this crate. Any Vulkan GPU will do,
 integrated ones included; Apple's GPUs are meant to come later through
 MoltenVK. A GPU is only trusted after it passes test vectors, once per
-process, and again with each wallet's own view key. A GPU that fails is
+process, and again with each wallet's own view key, and each point it hands
+back is checked: one off the curve fails the batch. A GPU that fails is
 retired until the process restarts. Which way a batch goes is a matter of
 speed and power, never of the answer.
 

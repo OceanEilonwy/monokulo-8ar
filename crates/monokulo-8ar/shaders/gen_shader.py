@@ -21,7 +21,9 @@ out = """#version 450
 // the digits of account (first_item + i) div tx_count, read from a buffer of
 // 64 signed digits an account. Each R is in the input once. INIT decompresses R and builds its table of 1R..8R,
 // WINDOW takes STEPS signed base-16 digits of a, FINAL does 8x, inverts Z and
-// hands back the compressed point: eight words, then whether R was off the curve.
+// hands back the compressed point: eight words, then a flag: 0, 1 if R was off
+// the curve, 2 if the point worked out isn't on it (a fault, as Z is never zero
+// and the formulas are complete).
 // CHECK runs one field operation, for the self-test vectors.
 //
 // Nothing here varies with a's digits but the values held: every table entry is
@@ -256,15 +258,21 @@ void window_stage(uint key, uint base) {
 void final_stage(uint key, uint base) {
     Proj s = Proj(sload(base), sload(base + 8u), sload(base + 16u));
     for (int i = 0; i < 3; i++) s = comp_proj(pdouble(s));
-    // Z is never zero for a point on the curve. The inversion is a fixed chain of
-    // squarings and multiplications, the same for every key.
+    // A point on the curve has Z not zero and (Y^2 - X^2)Z^2 = Z^4 + dX^2Y^2. One
+    // that isn't came from a fault, and the CPU mustn't take its answer.
+    Fe xx = fsq(s.x), yy = fsq(s.y), zz = fsq(s.z);
+    bool on_curve = !feq(s.z, ZERO) && feq(fmul(fsub(yy, xx), zz), fadd(fsq(zz), fmul(D, fmul(xx, yy))));
+    uint bad = state.s[base + FLAG];
+    uint flag = bad != 0u ? 1u : (on_curve ? 0u : 2u);
+    // The inversion is a fixed chain of squarings and multiplications, the same
+    // for every key.
     Fe eleven;
     Fe zinv = fmul(fsqn(fpow250(s.z, eleven), 5), eleven);
     Fe x = freeze(fmul(s.x, zinv));
     Fe y = freeze(fmul(s.y, zinv));
     y.a7 |= (x.a0 & 1u) << 31;
     uint at = key * 9u;
-""" + "".join(f"    output_keys.o[at + {i}u] = y.a{i};\n" for i in L) + """    output_keys.o[at + 8u] = state.s[base + FLAG];
+""" + "".join(f"    output_keys.o[at + {i}u] = y.a{i};\n" for i in L) + """    output_keys.o[at + 8u] = flag;
 }
 
 void check_stage(uint key) {

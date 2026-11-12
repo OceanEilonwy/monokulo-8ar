@@ -54,11 +54,13 @@ struct OnDalek {
     views: Vec<Scalar>,
     keys: Vec<[u8; 32]>,
     batch: usize,
+    /// An item whose words a faulty GPU gets wrong, and what it hands back.
+    fault: Option<(u64, [u32; 9])>,
 }
 
 impl OnDalek {
     fn new(views: &[Scalar], batch: usize) -> OnDalek {
-        OnDalek { views: views.to_vec(), keys: vec![], batch }
+        OnDalek { views: views.to_vec(), keys: vec![], batch, fault: None }
     }
 }
 
@@ -77,7 +79,10 @@ impl Deriver for OnDalek {
         assert!(count <= self.batch);
         let mut words = vec![];
         for item in first_item as usize..first_item as usize + count {
-            dalek_words(&self.views[item / self.keys.len()], &self.keys[item % self.keys.len()], &mut words);
+            match self.fault {
+                Some((at, wrong)) if at == item as u64 => words.extend(wrong),
+                _ => dalek_words(&self.views[item / self.keys.len()], &self.keys[item % self.keys.len()], &mut words),
+            }
         }
         Ok(gpu::Points::from_words(words))
     }
@@ -105,15 +110,19 @@ fn by_gpu(filter: &Prefilter, _view: &Scalar, blocks: &[ScannableBlock], threads
     filter.flag(blocks, threads, 0).expect("the GPU filtered")
 }
 
-#[test]
-fn the_dalek_stand_in_gives_what_a_gpu_gives() {
-    let view = Scalar::from(3u8);
-    // The first small y that isn't on the curve.
-    let bad = (2u8..).map(|y| {
+/// The first small y that isn't on the curve, canonically encoded.
+fn off_curve() -> [u8; 32] {
+    (2u8..).map(|y| {
         let mut bytes = [0; 32];
         bytes[0] = y;
         bytes
-    }).find(|bytes| CompressedEdwardsY(*bytes).decompress().is_none()).unwrap();
+    }).find(|bytes| CompressedEdwardsY(*bytes).decompress().is_none()).unwrap()
+}
+
+#[test]
+fn the_dalek_stand_in_gives_what_a_gpu_gives() {
+    let view = Scalar::from(3u8);
+    let bad = off_curve();
     let points = dalek_points(&view, &[small_order()[1], bad]);
     assert_eq!(points.len(), 2);
     assert_eq!(points.get(0), Some(dalek_derivation(&view, &CompressedEdwardsY(small_order()[1]).decompress().unwrap())));
@@ -330,8 +339,10 @@ fn every_way_of_being_paid(flag: Flagger) {
     bad[31] = 0x7f;
     assert!(CompressedPoint::from(bad).decompress().is_none());
     let zero = Scalar::ZERO;
-    let identity_pays = |rng: &mut StdRng| block_of(vec![stranger(rng), paying(&w, &zero, 1, w.spend)], extra_of(&[bad], None));
-    agree("a badly encoded key", flag, &w, &filter, &scanner, identity_pays(&mut rng), true);
+    let identity_pays = |rng: &mut StdRng, key: [u8; 32]| block_of(vec![stranger(rng), paying(&w, &zero, 1, w.spend)], extra_of(&[key], None));
+    agree("a badly encoded key", flag, &w, &filter, &scanner, identity_pays(&mut rng, bad), true);
+    // One encoded well, off the curve: the GPU says so, and it's the identity too.
+    agree("a key off the curve", flag, &w, &filter, &scanner, identity_pays(&mut rng, off_curve()), true);
 
     // Output keys that can't be scanned.
     let mut identity_out = stranger(&mut rng);
@@ -515,6 +526,50 @@ fn a_keyring_on_the_gpu_flags_what_dalek_does() {
     assert_eq!(a.unwrap(), dalek_hits(&first, &[w.view; 3], &blocks, 4, 1000));
     assert_eq!(b.unwrap(), dalek_hits(&second, &[w.view; 7], &blocks, 4, 1000));
     assert!(engine::gpu_ready(), "and it hasn't been retired");
+}
+
+/// Any answer a sound GPU can't give is an error, which retires the GPU, so the
+/// caller scans every block: never hits that leave a payment out.
+#[test]
+fn an_answer_the_gpu_got_wrong_is_never_taken() {
+    let (w, _, _) = wallet();
+    let blocks = keyring_blocks(&w);
+    let keyring = copies(&w, 2);
+    let views = [w.view; 2];
+    // One thread, so the jobs are in the order `jobs_of` gives them.
+    let sound = keyring.flag_by(&blocks, 1, 0, &mut OnDalek::new(&views, 100)).unwrap().unwrap();
+    // A point a slab in, on the second account: what a zero Z comes out as, with
+    // either sign; the GPU's own check failing; a flag it doesn't know; a y past
+    // p; and a key that's on the curve said to be off it.
+    let mut past_p = [u32::MAX; 9];
+    past_p[7] = 0x7fff_ffff;
+    past_p[8] = 0;
+    let mut odd_zero = [0; 9];
+    odd_zero[7] = 0x8000_0000;
+    let mut good = vec![];
+    dalek_words(&w.view, &point_of(&Scalar::ONE), &mut good);
+    let mut failed_check: [u32; 9] = good.clone().try_into().unwrap();
+    failed_check[8] = 2;
+    let mut unknown_flag = failed_check;
+    unknown_flag[8] = 7;
+    let mut refused = [0; 9];
+    refused[8] = 1;
+    let jobs = blocks.iter().enumerate().fold(vec![], |mut jobs, (i, block)| {
+        jobs_of(i, block, &mut jobs);
+        jobs
+    });
+    let item = jobs.len() as u64 + 150;
+    for (what, wrong) in [("zero", [0; 9]), ("odd zero", odd_zero), ("failed check", failed_check), ("unknown flag", unknown_flag), ("past p", past_p), ("refused", refused)] {
+        let mut faulty = OnDalek::new(&views, 100);
+        faulty.fault = Some((item, wrong));
+        assert!(keyring.flag_by(&blocks, 1, 0, &mut faulty).is_err(), "{what}");
+    }
+    // The same item handed back right is taken.
+    let mut sound_again = OnDalek::new(&views, 100);
+    let mut right = vec![];
+    dalek_words(&w.view, &sendable(&jobs[150].key), &mut right);
+    sound_again.fault = Some((item, right.try_into().unwrap()));
+    assert_eq!(keyring.flag_by(&blocks, 1, 0, &mut sound_again).unwrap().unwrap(), sound);
 }
 
 /// Whatever's in a transaction's extra, the keys read are `Extra::keys`' keys.

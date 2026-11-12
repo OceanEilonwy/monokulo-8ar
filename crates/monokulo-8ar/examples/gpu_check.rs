@@ -10,7 +10,7 @@
 
 use curve25519_dalek::{Scalar, constants::ED25519_BASEPOINT_TABLE, constants::EIGHT_TORSION, edwards::{CompressedEdwardsY, EdwardsPoint}};
 use crypto_bigint::{Encoding, U256, U512};
-use monokulo_8ar::gpu::{Arena, Device, Digits, TUNING, Tuning};
+use monokulo_8ar::gpu::{Arena, Derived, Device, Digits, TUNING, Tuning};
 
 const P_BIG: U256 = U256::from_be_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed");
 
@@ -147,11 +147,12 @@ fn compare(gpu: &Arena, view: &Scalar, keys: &[[u8; 32]], wants: &[Want], what: 
     let got = gpu.derive(&[&digits], keys).expect("the GPU ran");
     assert_eq!(got.len(), keys.len());
     for (i, want) in wants.iter().enumerate() {
-        match (got.get(i), want) {
-            (Some(bytes), Want::Point(want)) => assert_eq!(&bytes, want, "{what}: key {i} of {}: {:x?}", keys.len(), keys[i]),
-            (None, Want::OffCurve) => {}
-            (Some(_), Want::OffCurve) => panic!("{what}: key {i} is off the curve, and the GPU took it"),
-            (None, Want::Point(_)) => panic!("{what}: key {i} is on the curve, and the GPU refused it"),
+        match (got.derived(i), want) {
+            (Derived::Point(bytes), Want::Point(want)) => assert_eq!(&bytes, want, "{what}: key {i} of {}: {:x?}", keys.len(), keys[i]),
+            (Derived::OffCurve, Want::OffCurve) => {}
+            (Derived::Point(_), Want::OffCurve) => panic!("{what}: key {i} is off the curve, and the GPU took it"),
+            (Derived::OffCurve, Want::Point(_)) => panic!("{what}: key {i} is on the curve, and the GPU refused it"),
+            (Derived::Wrong, _) => panic!("{what}: key {i}'s answer failed the checks on it"),
         }
     }
 }
