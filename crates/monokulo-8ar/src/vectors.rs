@@ -9,7 +9,10 @@ use crypto_bigint::{Encoding, U256, U512};
 use curve25519_dalek::{Scalar, constants::{ED25519_BASEPOINT_TABLE, EIGHT_TORSION}, edwards::CompressedEdwardsY};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::gpu::{Arena, Digits, GpuError, Points};
+use crate::{
+    backend::Arena,
+    gpu::{Digits, GpuError, Points},
+};
 
 const P: [u32; 8] = [0xffff_ffed, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0x7fff_ffff];
 
@@ -240,7 +243,7 @@ mod tests {
     #[test]
     #[ignore = "needs a GPU; run with --ignored"]
     fn batches_in_turn_get_their_own_answers() {
-        let device = crate::gpu::Device::start_for_device(None, false).expect("a GPU");
+        let device = crate::backend::Device::start_for_device(None, false).expect("a GPU");
         let gpu = Arena::new(&device).expect("an arena");
         let (batch, group) = (gpu.tuning().batch, gpu.tuning().group as usize);
         let view = Scalar::from_bytes_mod_order([0x5a; 32]);

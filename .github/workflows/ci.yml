@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # glslc and spirv-cross for shaders/build.sh.
+  VULKAN_SDK_VERSION: 1.4.357.0
+
+jobs:
+  test:
+    name: Test (Linux, no GPU)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  shaders:
+    name: Shaders match gen_shader.py
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        id: sdk
+        with:
+          path: ~/vulkan-sdk
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}
+      - name: Fetch the Vulkan SDK's glslc and spirv-cross
+        if: steps.sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/vulkan-sdk
+          curl -sSfL "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/vulkansdk-linux-x86_64-$VULKAN_SDK_VERSION.tar.xz" \
+            | tar -xJ -C ~/vulkan-sdk --strip-components=2 --wildcards '*/x86_64/bin/glslc' '*/x86_64/bin/spirv-cross'
+      - name: Regenerate scan.comp, scan.spv and scan.metal
+        run: PATH="$HOME/vulkan-sdk/bin:$PATH" crates/monokulo-8ar/shaders/build.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shaders
+          path: crates/monokulo-8ar/shaders/
+      - name: The checked-in files are what build.sh writes
+        run: |
+          git status --porcelain -- crates/monokulo-8ar/shaders/
+          git diff --exit-code -- crates/monokulo-8ar/shaders/
+          test -z "$(git status --porcelain -- crates/monokulo-8ar/shaders/)"
+
+  metal:
+    name: Metal (macOS) and iOS build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --features monokulo-8ar/metal -- -D warnings
+      # The ignored tests are the ones that need a GPU: the vectors among them.
+      - name: Tests on Metal, the GPU's included
+        run: cargo test --workspace --features monokulo-8ar/metal -- --include-ignored
+      - name: gpu_check on Metal
+        run: cargo run --release --features monokulo-8ar/metal --example gpu_check -- --rounds 1
+      - name: scan_speed on Metal
+        run: |
+          cargo run --release --features monokulo-8ar/metal --example scan_speed -- prototypes/fixtures/mainnet-3797000-2000.bin --runs 3
+          cargo run --release --features monokulo-8ar/metal --example scan_speed -- prototypes/fixtures/mainnet-3797000-2000.bin --keys 10
+      - name: Builds for iOS
+        run: cargo build --release --target aarch64-apple-ios --features monokulo-8ar/metal --lib

@@ -1,4 +1,6 @@
-//! 8aR on the GPU, in Vulkan compute (`shaders/scan.comp`).
+//! 8aR on the GPU, in Vulkan compute (`shaders/scan.comp`), and what the Metal
+//! backend (`metal.rs`) shares with it: the view key's [`Digits`], the
+//! [`Points`] handed back and how they're checked, [`Tuning`] and [`GpuError`].
 //!
 //! The GPU does the curve arithmetic, inverts each point's Z and hands back the
 //! compressed points; the CPU does everything after. A key that isn't on the
@@ -126,14 +128,18 @@ pub enum GpuErrorKind {
     NoGpu,
     /// A GPU that went wrong.
     Failed,
+    /// The GPU wasn't allowed to run the work: iOS refuses an app in the
+    /// background the GPU. Nothing is wrong with it, so it isn't retired; the
+    /// batch is scanned without it and the next one tries again.
+    Background,
 }
 
 impl GpuError {
-    fn new(kind: GpuErrorKind, what: String) -> GpuError {
+    pub(crate) fn new(kind: GpuErrorKind, what: String) -> GpuError {
         GpuError { what, kind }
     }
 
-    fn failed(what: String) -> GpuError {
+    pub(crate) fn failed(what: String) -> GpuError {
         GpuError::new(GpuErrorKind::Failed, what)
     }
 }
@@ -158,9 +164,15 @@ pub enum Derived {
 pub struct Points(Zeroizing<Vec<u32>>);
 
 impl Points {
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "metal", target_vendor = "apple")))]
     pub(crate) fn from_words(words: Vec<u32>) -> Points {
         Points(Zeroizing::new(words))
+    }
+
+    /// The words as the GPU handed them back, nine an item.
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
+    pub(crate) fn words(&self) -> &[u32] {
+        &self.0
     }
 
     /// Item `i`'s point, compressed, or `None` if its key wasn't on the curve or

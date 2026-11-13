@@ -10,7 +10,7 @@
 
 use curve25519_dalek::{Scalar, constants::ED25519_BASEPOINT_TABLE, constants::EIGHT_TORSION, edwards::{CompressedEdwardsY, EdwardsPoint}};
 use crypto_bigint::{Encoding, U256, U512};
-use monokulo_8ar::gpu::{Arena, Derived, Device, Digits, TUNING, Tuning};
+use monokulo_8ar::backend::{Arena, Derived, Device, Digits, TUNING, Tuning};
 
 const P_BIG: U256 = U256::from_be_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed");
 

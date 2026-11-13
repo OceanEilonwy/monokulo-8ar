@@ -12,9 +12,10 @@
 //! a caller to hand the `Scanner` only those; a block it can't vouch for is
 //! [`Txs::All`].
 //!
-//! The arithmetic runs on the GPU, in Vulkan, and only there: a GPU passes test
-//! vectors once per process before it's used, and again with each wallet's view
-//! key (`vectors.rs`). Without a GPU that passed, or for a batch too small to be
+//! The arithmetic runs on the GPU, and only there: in Vulkan ([`gpu`]), or in
+//! Metal on Apple's platforms with the `metal` feature ([`backend`] is the one
+//! a build uses). In either, a GPU passes test vectors once per process before
+//! it's used, and again with each wallet's view key (`vectors.rs`). Without a GPU that passed, or for a batch too small to be
 //! worth one, [`Prefilter::flag`] says it didn't filter, and the caller scans
 //! every block with the `Scanner`. Which way is a matter of speed and power,
 //! never of the answer. [`engine`] says which is in use.
@@ -30,7 +31,20 @@
 
 mod engine;
 pub mod gpu;
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+pub mod metal;
 mod vectors;
+
+/// The GPU backend this build uses: Metal on Apple's platforms with the `metal`
+/// feature, which have no Vulkan, and Vulkan everywhere else. Both have the same
+/// `Device` and `Arena`, and share the rest of [`gpu`].
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+pub use metal as backend;
+/// The GPU backend this build uses: Metal on Apple's platforms with the `metal`
+/// feature, which have no Vulkan, and Vulkan everywhere else. Both have the same
+/// `Device` and `Arena`, and share the rest of [`gpu`].
+#[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+pub use gpu as backend;
 
 pub use engine::{Arena, Engine, Reason, check_wallet, engine, gpu_failed, gpu_identity, gpu_ready, rest, set_cache_dir, settle, warm_up};
 
@@ -63,12 +77,12 @@ const NEWEST_FORK: u8 = 16;
 const CHUNK: usize = 64;
 
 /// Runs the check a GPU must pass before it's used: for the test tool.
-pub fn startup_vectors(gpu: &gpu::Arena) -> Result<bool, gpu::GpuError> {
+pub fn startup_vectors(gpu: &backend::Arena) -> Result<bool, gpu::GpuError> {
     vectors::passes(gpu)
 }
 
 /// Runs the check a wallet's own view key must pass: for the test tool.
-pub fn wallet_vectors(gpu: &gpu::Arena, view: &Zeroizing<[u8; 32]>) -> Result<bool, gpu::GpuError> {
+pub fn wallet_vectors(gpu: &backend::Arena, view: &Zeroizing<[u8; 32]>) -> Result<bool, gpu::GpuError> {
     vectors::passes_for_wallet(gpu, view)
 }
 
@@ -281,7 +295,7 @@ trait Deriver {
     fn unload(&mut self);
 }
 
-struct OnGpu<'a>(&'a gpu::Arena);
+struct OnGpu<'a>(&'a backend::Arena);
 
 impl Deriver for OnGpu<'_> {
     fn batch(&self) -> usize {
