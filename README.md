@@ -6,7 +6,8 @@ Proving that a block doesn't pay a wallet is nearly all of a scan's cost:
 8·a·R for each transaction key (a is the view key, R the key), then a view
 tag for each output. monero-oxide's `Scanner` works out 8aR once per output
 and decompresses every output key. This crate has a GPU (Vulkan, through
-`ash`) work out 8aR once per transaction key, tens of thousands of keys per
+`ash`, or Metal on Apple's platforms, through `objc2-metal`) work out 8aR once
+per transaction key, tens of thousands of keys per
 dispatch, compressed on the GPU, and only decompresses an output key past a
 matching view tag.
 
@@ -19,8 +20,8 @@ understand (a newer fork, missing transactions) is flagged. Its reading of
 The prefilter runs on the GPU only. There is no CPU version of its curve
 arithmetic: without a GPU, the caller scans every block with the `Scanner`,
 which is slower but needs nothing from this crate. Any Vulkan GPU will do,
-integrated ones included; Apple's GPUs are meant to come later through
-MoltenVK. A GPU is only trusted after it passes test vectors, once per
+integrated ones included, and so will any Apple GPU through Metal, with the
+`metal` feature (below). A GPU is only trusted after it passes test vectors, once per
 process, and again with each wallet's own view key, and each point it hands
 back is checked: one off the curve fails the batch. A GPU that fails is
 retired until the process restarts. Which way a batch goes is a matter of
@@ -61,6 +62,18 @@ speed and power, never of the answer.
   `Keyring::new` and `Prefilter` use the shared arena, one a process as a
   phone wants; `Keyring::with_arena(Arena::new())` gives a keyring its own,
   so a server's lanes don't wait on each other's batches.
+- `metal` (the `metal` feature, built on Apple targets only): the same
+  `Device` and `Arena` in Metal, for iOS and macOS, which have no Vulkan.
+  `backend` is whichever a build uses: Metal on Apple's platforms with the
+  feature, Vulkan everywhere else. `Prefilter` and `Keyring` don't change, and
+  neither does the trust model: the same vectors, the same check of every point,
+  and a GPU that fails is retired. One thing is Apple's own: iOS refuses the GPU
+  to an app in the background, failing its command buffers with
+  `MTLCommandBufferErrorNotPermitted`. That's `GpuErrorKind::Background`: the
+  batch goes to the CPU, as for any failure, but the GPU isn't retired for it,
+  so an app back in the foreground has it again. A warm-up that runs into it
+  ends as if it hadn't started, and the next batch starts it again. Metal keeps
+  its compiled shaders in a cache of its own, so `set_cache_dir` isn't used.
 - `prototypes/fixtures`: 2,000 real mainnet blocks' transaction keys and view
   tags, from height 3,797,000, for `examples/scan_speed.rs`. The prototypes
   that wrote them are in the git history.
@@ -117,20 +130,50 @@ accounts is about 19 s. `--tip 1,10,100` measures the energy of small catch-ups 
 (see the example's header). `examples/gpu_check.rs` holds a GPU to
 curve25519-dalek's answers at length.
 
+### Metal
+
+On a Mac, the same with `--features monokulo-8ar/metal`:
+
+```sh
+cargo test --workspace --features monokulo-8ar/metal -- --include-ignored
+cargo run --release --features monokulo-8ar/metal --example gpu_check
+cargo run --release --features monokulo-8ar/metal --example scan_speed -- \
+    prototypes/fixtures/mainnet-3797000-2000.bin
+```
+
+CI does all three on a GitHub macOS runner, and builds the crate for
+`aarch64-apple-ios`. The runner's GPU is the virtual machine's "Apple
+Paravirtual device", which passes the vectors and gives the fixture's
+digest, but is no measure of an Apple GPU's speed (warm, default tuning):
+
+| GPU | keys | blocks/s | derivations/s |
+|---|---|---|---|
+| Apple Paravirtual device (CI, macOS 15) | 1 | 750 | 43,000 |
+| Apple Paravirtual device (CI, macOS 15) | 10 | 74 | 42,000 |
+
+Its first start, compiling the shader, took 14 s, and later ones about 8 s.
+An iPad's numbers need `gpu_check` and `scan_speed` run on the device, which
+CI can't do: they're for the owner to add here, beside the RX 6800 XT's.
+
 ## The shader
 
 `shaders/gen_shader.py` writes `shaders/scan.comp` (GLSL), and `glslc` from
-the Vulkan SDK or shaderc compiles it to `shaders/scan.spv`, which the crate
-embeds. Both outputs are checked in, so building needs no shader tools. After
-changing `gen_shader.py`:
+the Vulkan SDK or shaderc compiles it to `shaders/scan.spv`, which the Vulkan
+backend embeds. SPIRV-Cross writes Metal's copy, `shaders/scan.metal`, from
+SPIR-V compiled again without `-O`: the optimised SPIR-V turned into 6 MB of
+MSL with every name stripped, and Metal's compiler optimises it anyway. All
+three are checked in, so building needs no shader tools. After changing
+`gen_shader.py`:
 
 ```sh
 crates/monokulo-8ar/shaders/build.sh
 ```
 
-which runs `python3 gen_shader.py` and
-`glslc --target-env=vulkan1.0 -O -o scan.spv scan.comp`. Then run the tests
-with a GPU.
+with `glslc` and `spirv-cross` from the Vulkan SDK on the path. CI runs it with
+the SDK version named in `.github/workflows/ci.yml` and fails if any of the
+three differs from what's checked in, and a test holds `metal.rs`'s buffer
+numbers to the ones SPIRV-Cross gave `scan.metal`. Then run the tests with a
+GPU, on Vulkan and on Metal.
 
 ## Licence
 

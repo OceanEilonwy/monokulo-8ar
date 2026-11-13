@@ -36,7 +36,7 @@ pub enum Reason {
     Starting,
     /// No Vulkan loader or driver. (Metal is part of Apple's systems.)
     NoVulkan,
-    /// Vulkan, but no hardware GPU that can do the work.
+    /// No hardware GPU that can do the work: Vulkan without one, or no Metal device.
     NoGpu,
     /// The GPU gave a wrong answer to the test vectors.
     FailedSelfTest,

@@ -14,9 +14,8 @@
 //!
 //! The arithmetic runs on the GPU, and only there: in Vulkan ([`gpu`]), or in
 //! Metal on Apple's platforms with the `metal` feature ([`backend`] is the one
-//! a build uses). In either, a GPU passes test
-//! vectors once per process before it's used, and again with each wallet's view
-//! key (`vectors.rs`). Without a GPU that passed, or for a batch too small to be
+//! a build uses). In either, a GPU passes test vectors once per process before
+//! it's used, and again with each wallet's view key (`vectors.rs`). Without a GPU that passed, or for a batch too small to be
 //! worth one, [`Prefilter::flag`] says it didn't filter, and the caller scans
 //! every block with the `Scanner`. Which way is a matter of speed and power,
 //! never of the answer. [`engine`] says which is in use.
