@@ -18,6 +18,15 @@ crypto-bigint = { version = "0.5", default-features = false }
 zeroize = "1"
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
 
+[features]
+# Metal on Apple's platforms in place of Vulkan, which they don't have (src/metal.rs).
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 # For atexit: a process returning from main waits for a warm-up still in the driver.
 libc = "0.2"

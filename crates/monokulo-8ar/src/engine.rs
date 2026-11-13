@@ -13,7 +13,8 @@ use std::{
 use zeroize::Zeroizing;
 
 use crate::{
-    gpu::{self, Device, GpuError, GpuErrorKind},
+    backend::{self, Device},
+    gpu::{GpuError, GpuErrorKind},
     vectors,
 };
 
@@ -33,7 +34,7 @@ pub enum Reason {
     NotStarted,
     /// It's setting up the GPU and running the test vectors.
     Starting,
-    /// No Vulkan loader or driver.
+    /// No Vulkan loader or driver. (Metal is part of Apple's systems.)
     NoVulkan,
     /// Vulkan, but no hardware GPU that can do the work.
     NoGpu,
@@ -66,6 +67,9 @@ static NAME: OnceLock<String> = OnceLock::new();
 static WARM_UP: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 /// Set by the warm-up thread as its last act, for [`settle`] to wait on.
 static DONE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+/// Whether the exit handler that waits for a warm-up is registered.
+#[cfg(unix)]
+static AT_EXIT: std::sync::Once = std::sync::Once::new();
 /// How long a process exiting waits for a warm-up still inside the driver.
 /// Only the first run of a cold cache compiles the shader (20–30 s); after
 /// that a warm-up is over in well under a second.
@@ -79,28 +83,27 @@ pub fn set_cache_dir(dir: PathBuf) {
 /// Starts the GPU on a thread of its own, if it's not been: compiles the shader,
 /// then has it pass the test vectors before anything else is asked of it. It
 /// starts once per process, so this is the check on each cold start of an app.
+/// An app in the background on iOS can't use the GPU; a warm-up that runs into
+/// that ends as if it hadn't started, and the next batch starts it again.
 pub fn warm_up() {
     if STATE.compare_exchange(NOT_STARTED, STARTING, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
+    *DONE.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
     let dir = CACHE_DIR.lock().expect("cache lock").clone();
     let started = std::thread::Builder::new().name("monokulo-8ar-gpu".into()).spawn(move || {
         let state = match Device::start_for_device(dir, false) {
             // The vectors run in an arena of their own, freed after.
-            Ok(device) => match gpu::Arena::new(&device).and_then(|arena| vectors::passes(&arena)) {
+            Ok(device) => match backend::Arena::new(&device).and_then(|arena| vectors::passes(&arena)) {
                 Ok(true) => {
                     let _ = NAME.set(device.name().to_owned());
                     *DEVICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(device);
                     READY
                 }
                 Ok(false) => FAILED_SELF_TEST,
-                Err(_) => FAILED,
+                Err(e) => after_failure(e.kind),
             },
-            Err(e) => match e.kind {
-                GpuErrorKind::NoVulkan => NO_VULKAN,
-                GpuErrorKind::NoGpu => NO_GPU,
-                GpuErrorKind::Failed => FAILED,
-            },
+            Err(e) => after_failure(e.kind),
         };
         STATE.store(state, Ordering::Relaxed);
         finished();
@@ -111,7 +114,7 @@ pub fn warm_up() {
             // A process that returns from main while this thread is still in
             // the driver can crash in the driver's own teardown: wait for it.
             #[cfg(unix)]
-            {
+            AT_EXIT.call_once(|| {
                 extern "C" fn at_exit() {
                     settle(EXIT_WAIT);
                 }
@@ -121,12 +124,23 @@ pub fn warm_up() {
                 unsafe {
                     libc::atexit(at_exit);
                 }
-            }
+            });
         }
         Err(_) => {
             STATE.store(FAILED, Ordering::Relaxed);
             finished();
         }
+    }
+}
+
+/// The state a warm-up that failed in this way leaves the GPU in. Only iOS
+/// refusing an app in the background the GPU leaves it to be started again.
+fn after_failure(kind: GpuErrorKind) -> u8 {
+    match kind {
+        GpuErrorKind::NoVulkan => NO_VULKAN,
+        GpuErrorKind::NoGpu => NO_GPU,
+        GpuErrorKind::Background => NOT_STARTED,
+        GpuErrorKind::Failed => FAILED,
     }
 }
 
@@ -210,7 +224,7 @@ fn retire() {
 /// whole `flag_many` at a time. Nothing is made until the GPU is ready and a
 /// batch needs it.
 #[derive(Clone, Default)]
-pub struct Arena(Arc<Mutex<Option<gpu::Arena>>>);
+pub struct Arena(Arc<Mutex<Option<backend::Arena>>>);
 
 impl Arena {
     pub fn new() -> Arena {
@@ -223,8 +237,9 @@ impl Arena {
     }
 
     /// Runs `work` in this arena, making it if need be. `None` if the GPU isn't
-    /// ready, or `work` failed, which retires the GPU.
-    pub(crate) fn with<T>(&self, work: impl FnOnce(&gpu::Arena) -> Result<T, GpuError>) -> Option<T> {
+    /// ready, or `work` failed, which retires the GPU, unless it failed only
+    /// because the app is in the background.
+    pub(crate) fn with<T>(&self, work: impl FnOnce(&backend::Arena) -> Result<T, GpuError>) -> Option<T> {
         let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let device = match STATE.load(Ordering::Relaxed) {
             READY => device(),
@@ -236,7 +251,7 @@ impl Arena {
             return None;
         };
         if held.as_ref().is_none_or(|arena| !Arc::ptr_eq(arena.device(), &device)) {
-            match gpu::Arena::new(&device) {
+            match backend::Arena::new(&device) {
                 Ok(arena) => *held = Some(arena),
                 Err(_) => {
                     retire();
@@ -246,6 +261,10 @@ impl Arena {
         }
         match work(held.as_ref().expect("just made")) {
             Ok(done) => Some(done),
+            // iOS refused the work, as the app isn't in the foreground: this
+            // batch goes to the CPU, and the GPU is there for the next once it
+            // is. The arena has already let go of its memory.
+            Err(e) if e.kind == GpuErrorKind::Background => None,
             Err(_) => {
                 held.take();
                 retire();
@@ -314,5 +333,15 @@ mod tests {
         assert_ne!(engine(), Engine::Cpu { reason: Reason::NotStarted });
         assert!(settle(Duration::from_millis(1)), "and asking again costs nothing");
         assert!(WARM_UP.lock().unwrap().is_none(), "the thread was joined");
+    }
+
+    /// A GPU that failed is given up on, but not one iOS refused only because
+    /// the app was in the background: that one is started again.
+    #[test]
+    fn only_the_background_leaves_the_gpu_to_be_started_again() {
+        assert_eq!(after_failure(GpuErrorKind::Background), NOT_STARTED);
+        assert_eq!(after_failure(GpuErrorKind::Failed), FAILED);
+        assert_eq!(after_failure(GpuErrorKind::NoGpu), NO_GPU);
+        assert_eq!(after_failure(GpuErrorKind::NoVulkan), NO_VULKAN);
     }
 }

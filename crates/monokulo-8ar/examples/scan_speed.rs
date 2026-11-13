@@ -21,7 +21,7 @@
 
 use std::{io::Read, sync::atomic::{AtomicUsize, Ordering}, time::Instant};
 
-use monokulo_8ar::gpu::{Arena, Device, Digits, TUNING, Tuning};
+use monokulo_8ar::backend::{Arena, Device, Digits, TUNING, Tuning};
 use curve25519_dalek::Scalar;
 use sha3::{Digest, Keccak256};
 
