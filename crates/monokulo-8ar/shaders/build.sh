@@ -7,6 +7,10 @@ set -e
 cd "$(dirname "$0")"
 python3 gen_shader.py
 glslc --target-env=vulkan1.0 -O -o scan.spv scan.comp
-# Metal's copy of the same shader, for src/metal.rs. MSL 2.0 runs on every
-# Apple GPU that iOS 13 and macOS 10.15 run on.
-spirv-cross --msl --msl-version 20000 --output scan.metal scan.spv
+# Metal's copy of the same shader, for src/metal.rs, from SPIR-V compiled
+# again without -O: the optimiser inlines every call and strips the names,
+# which made 6 MB of MSL whose buffers can't be told apart. Metal's compiler
+# optimises it. MSL 2.0 runs on every GPU that iOS 13 and macOS 10.15 do.
+glslc --target-env=vulkan1.0 -o scan-msl.tmp scan.comp
+spirv-cross --msl --msl-version 20000 --output scan.metal scan-msl.tmp
+rm scan-msl.tmp

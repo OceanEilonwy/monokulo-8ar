@@ -47,7 +47,10 @@ jobs:
           name: shaders
           path: crates/monokulo-8ar/shaders/
       - name: The checked-in files are what build.sh writes
-        run: git diff --exit-code -- crates/monokulo-8ar/shaders/
+        run: |
+          git status --porcelain -- crates/monokulo-8ar/shaders/
+          git diff --exit-code -- crates/monokulo-8ar/shaders/
+          test -z "$(git status --porcelain -- crates/monokulo-8ar/shaders/)"
 
   metal:
     name: Metal (macOS) and iOS build
